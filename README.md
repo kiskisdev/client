@@ -660,54 +660,58 @@ do {
 
 ## Sandbox vs Production
 
-Apple has two separate attestation environments. You must use the right one or attestation will fail silently.
+Apple has two separate attestation environments. Kiskis keeps their data completely separate — different configs, different device registries, different billing.
 
-**Sandbox** — for development and testing. Apple's sandbox attestation server validates attestations from debug builds and the Xcode simulator (which fakes a Secure Enclave since it doesn't have one). Kiskis's server accepts sandbox attestation objects and validates them against Apple's sandbox certificate chain.
+**Sandbox** — for development and testing. Apple's sandbox attestation server validates attestations from debug builds and the Xcode simulator. Kiskis stores sandbox device keys and configs separately from production.
 
-**Production** — for TestFlight and App Store. Apple's production attestation server only validates attestations from real devices running release-signed binaries. Kiskis validates against Apple's production certificate chain.
+**Production** — for TestFlight and App Store. Apple's production attestation server only validates attestations from real devices running release-signed binaries.
 
-**The SDK auto-detects the environment:**
+**Environment detection is server-side — you don't need to do anything.**
 
-```swift
-// DEBUG builds (Xcode Run, debug on device) → .sandbox
-// Release builds (TestFlight, App Store) → .production
+When a device attests, Apple embeds an `AAGUID` field in the signed attestation data:
+- `appattestsandbox` → the device used Apple's sandbox attestation service
+- `appattest` → the device used Apple's production attestation service
 
-// This happens automatically via:
-#if DEBUG
-    environment = .sandbox
-#else
-    environment = .production
-#endif
+The Kiskis server reads this field directly from Apple's signed data. It cannot be faked or overridden by the client — it's part of the cryptographic attestation. The server uses it to:
+1. Store the device in the correct environment partition (sandbox vs production)
+2. Return the detected environment to the SDK
+3. Serve configs from the matching environment's S3 path
+
+```
+Debug build on device:
+  1. App Attest goes through Apple's SANDBOX attestation service
+  2. Apple embeds "appattestsandbox" in the AAGUID
+  3. Kiskis server reads AAGUID → detects sandbox
+  4. Stores device in SANDBOX#TeamID#BundleID
+  5. Serves config from s3://vault/sandbox/{hash}/manifest.json
+
+Release build (TestFlight/App Store):
+  1. App Attest goes through Apple's PRODUCTION attestation service
+  2. Apple embeds "appattest" in the AAGUID
+  3. Kiskis server reads AAGUID → detects production
+  4. Stores device in PROD#TeamID#BundleID
+  5. Serves config from s3://vault/production/{hash}/manifest.json
 ```
 
-**If auto-detection is wrong, override it:**
+**On first launch**, the SDK uses `#if DEBUG` as a temporary hint until attestation completes. Once the server responds with the detected environment, the SDK persists it in the Keychain for all future launches. The server's detection overrides the `#if DEBUG` hint.
+
+**You can force an environment if needed:**
 
 ```swift
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
-    environment: .production   // Force production even in debug
+    environment: .production   // Override server detection (rare)
 )
 ```
 
-**When would you override?** Rarely. The main case is if you're running a release build locally for performance testing — the `#if DEBUG` flag is false, so the SDK correctly uses production. But if you're running a debug build against a production Kiskis server (unusual), you'd need to force `.production`.
-
-**What goes wrong if it's mismatched:**
-
-| SDK says | Server expects | Result |
-|----------|---------------|--------|
-| Sandbox | Sandbox | Works |
-| Production | Production | Works |
-| Sandbox | Production | Attestation fails — Apple sandbox cert not trusted by production chain |
-| Production | Sandbox | Attestation fails — production cert not trusted by sandbox chain |
-
-The Kiskis server accepts both sandbox and production attestations — it checks the environment flag from the request and validates against the appropriate Apple certificate chain. So the SDK's environment setting must match how the app was built, not how the server is configured.
+This is rarely needed — the server detection is authoritative and correct for all normal development and release workflows.
 
 ## Testing
 
-| Environment | Secure Enclave | Attestation | Auto-Detected As |
-|-------------|----------------|-------------|-------------------|
-| Xcode Simulator | No (mocked) | Sandbox | `.sandbox` |
-| Physical device (debug) | Yes | Sandbox | `.sandbox` |
+| Environment | Secure Enclave | Apple Attestation | Server Detects |
+|-------------|----------------|-------------------|----------------|
+| Xcode Simulator | No (mocked) | Sandbox | `sandbox` |
+| Physical device (debug) | Yes | Sandbox | `sandbox` |
 | Physical device (release) | Yes | Production | `.production` |
 | TestFlight | Yes | Production | `.production` |
 | App Store | Yes | Production | `.production` |

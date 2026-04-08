@@ -191,11 +191,21 @@ public final class KiskisClient: @unchecked Sendable {
         self.zeroKnowledge = zeroKnowledge
         self.fallbackConfigURL = fallbackConfig
 
-        #if DEBUG
-        self.environment = environment ?? .sandbox
-        #else
-        self.environment = environment ?? .production
-        #endif
+        // Environment detection priority:
+        // 1. Explicit override (if developer passed environment:)
+        // 2. Server-detected from previous attestation (persisted in Keychain)
+        // 3. Fallback to #if DEBUG heuristic (used until first attestation)
+        if let env = environment {
+            self.environment = env
+        } else if let persisted = KeychainHelper.load(key: "kiskis.env.\(self.teamId).\(self.bundleId)") {
+            self.environment = persisted == "sandbox" ? .sandbox : .production
+        } else {
+            #if DEBUG
+            self.environment = .sandbox
+            #else
+            self.environment = .production
+            #endif
+        }
 
         let keychainGroup = "kiskis.\(self.teamId).\(self.bundleId)"
         self.configCache = ConfigCache(keychainGroup: keychainGroup, cachePolicy: cachePolicy)
@@ -434,6 +444,18 @@ public final class KiskisClient: @unchecked Sendable {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let errorBody = String(data: data, encoding: .utf8) ?? "Unknown error"
             throw KiskisError.attestationFailed(errorBody)
+        }
+
+        // Server detects environment from Apple's AAGUID field — authoritative
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let serverEnv = json["environment"] as? String {
+            if serverEnv == "sandbox" {
+                environment = .sandbox
+            } else {
+                environment = .production
+            }
+            // Persist so subsequent launches use the correct environment
+            KeychainHelper.save(key: "kiskis.env.\(teamId).\(bundleId)", value: serverEnv)
         }
 
         // Save keyId for future assertions
