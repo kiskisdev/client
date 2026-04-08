@@ -19,10 +19,16 @@ Kiskis delivers API keys and configuration to your app at runtime — secured by
 In Xcode: **File → Add Package Dependencies** → enter:
 
 ```
-https://github.com/ToddHoff/kiskis-client
+https://github.com/kiskisdev/client
 ```
 
 Select subdirectory **`ios`**, then add the **Kiskis** library.
+
+**CLI tool** (for uploading configs from your terminal):
+```bash
+brew tap kiskisdev/homebrew-cli
+brew install kiskis
+```
 
 **Requirements:** iOS 14+, Swift 5.9+, Xcode 15+
 
