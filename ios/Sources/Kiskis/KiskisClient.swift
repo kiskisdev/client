@@ -178,7 +178,7 @@ public final class KiskisClient: @unchecked Sendable {
     public init(
         teamId: String,
         bundleId: String? = nil,
-        apiURL: URL = URL(string: "https://vyy382jkp3.execute-api.us-west-1.amazonaws.com/v1")!,
+        apiURL: URL = URL(string: "https://api.kiskis.dev")!,
         cachePolicy: CachePolicy = CachePolicy(),
         zeroKnowledge: ZeroKnowledgeMode = .disabled,
         fallbackConfig: URL? = nil,
