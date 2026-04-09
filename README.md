@@ -1,6 +1,6 @@
 # Kiskis Client
 
-**Keep It Secret, Keep It Safe**
+**Keep It Safe. Keep It Secret.**
 
 Kiskis delivers API keys and configuration to your app at runtime — secured by hardware attestation. No keys in your binary. No Firebase. No vendor lock-in.
 
