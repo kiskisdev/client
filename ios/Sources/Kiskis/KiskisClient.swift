@@ -355,6 +355,28 @@ public final class KiskisClient: @unchecked Sendable {
         return userData
     }
 
+    // MARK: - Public API: Push Notification Registration
+
+    /// Associate this device with a user ID for push targeting.
+    /// Call this after your user logs in (e.g., with their iCloud recordID).
+    /// The user ID enables cross-device push delivery — sending a push to this
+    /// userId will reach ALL their devices within this team/bundle.
+    ///
+    /// Example use case: SwiftData sync notification — when data changes on one
+    /// device, send a push to the userId so all other devices refresh immediately.
+    public func setUserId(_ userId: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["user_id": userId])
+        var request = try await signedRequest(path: "push/register")
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (_, response) = try await urlSession.kiskisData(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw KiskisError.networkError("Failed to register userId for push")
+        }
+    }
+
     // MARK: - Internal: Assertion-Based Request Signing
 
     /// Build a request with assertion headers.

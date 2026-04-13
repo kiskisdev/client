@@ -588,6 +588,121 @@ Use `identifierForVendor` (per-device ID). Data works on that device but won't s
 
 ---
 
+## Push Notifications
+
+Kiskis can send push notifications to your users' devices — no Firebase, no server of your own. Send to a specific user (all their devices), a single device, or broadcast to everyone.
+
+### Why This Matters
+
+SwiftData and CloudKit replication can take minutes. A silent push through Kiskis triggers an immediate sync on all the user's devices, cutting wait time from minutes to seconds.
+
+### Setup
+
+**1. Add capabilities in Xcode:**
+- Push Notifications (Signing & Capabilities)
+- Background Modes → Remote notifications
+
+**2. Register for push and hand the token to Kiskis:**
+
+```swift
+// AppDelegate.swift
+func application(_ application: UIApplication,
+                 didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
+    application.registerForRemoteNotifications()
+    return true
+}
+
+func application(_ application: UIApplication,
+                 didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+    let token = deviceToken.map { String(format: "%02x", $0) }.joined()
+    KiskisClient.shared?.pushToken = token
+}
+```
+
+**3. Handle incoming pushes:**
+
+```swift
+func application(_ application: UIApplication,
+                 didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                 fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+    if let kiskis = userInfo["kiskis"] as? [String: Any],
+       kiskis["action"] as? String == "refresh" {
+        Task {
+            _ = try? await KiskisClient.shared?.fetchConfig()
+            completionHandler(.newData)
+        }
+    } else {
+        // Your own push handling here
+        completionHandler(.noData)
+    }
+}
+```
+
+**4. Associate users with devices:**
+
+```swift
+// After user logs in — enables cross-device push targeting
+let recordID = try await CKContainer.default().userRecordID()
+try await kiskis.setUserId(recordID.recordName)
+```
+
+### Sending Pushes
+
+From your backend, the CLI, or the dashboard:
+
+```bash
+# Silent push to all of a user's devices (cross-device sync)
+kiskis push:send --key $KEY --to "user_id" \
+  --silent --data '{"action": "sync"}'
+
+# Visible push to a single device
+kiskis push:send --key $KEY --device "keyId_abc" \
+  --title "Update" --body "New data available"
+
+# Broadcast to all users
+kiskis push:broadcast --key $KEY \
+  --title "New feature!" --body "Dark mode is here"
+
+# Check delivery status
+kiskis push:status --key $KEY --id push_a7f3b9c2
+```
+
+Or use the REST API directly:
+
+```bash
+curl -X POST https://api.kiskis.dev/push/send \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"user_id","silent":true,"data":{"action":"sync"}}'
+```
+
+### APNs Key Setup
+
+Kiskis needs your APNs `.p8` signing key to deliver pushes. Generate one in the [Apple Developer Portal](https://developer.apple.com/account/resources/authkeys/list) under Keys → Apple Push Notifications service.
+
+```bash
+kiskis push:setup --key $KEY \
+  --apns-key-file AuthKey_XXXX.p8 \
+  --apns-key-id XXXX \
+  --apns-team-id YOUR_TEAM_ID
+```
+
+One APNs key works for all apps in your developer account.
+
+### Silent vs Visible
+
+| Type | User sees it? | Best for |
+|------|--------------|----------|
+| Silent (`"silent": true`) | No | Data sync, config refresh, background updates |
+| Visible (title + body) | Yes | Alerts, marketing, user-facing messages |
+
+### How It Scales
+
+Broadcasts to 50,000+ devices use SQS fan-out: the API returns immediately with a push ID, then workers process batches of 100 tokens in parallel over HTTP/2 to Apple's servers. Check progress with `/push/status/{id}`.
+
+---
+
 ## Version Matching
 
 Upload different configs for different app versions:
@@ -732,6 +847,8 @@ This is rarely needed — the server detection is authoritative and correct for 
 | Binary Blobs | Large files via presigned S3 URLs, SHA-256 verified |
 | Per-User Data | Any user identifier, cross-device sync |
 | Offline Caching | 3-level cache (memory → file → server), works on subway |
+| Push Notifications | Send to users, devices, or broadcast — no Firebase needed |
+| Cross-Device Sync Push | Silent push triggers instant SwiftData/CloudKit refresh |
 | Emergency Push | Silent APNs push forces immediate config re-fetch |
 | Device Migration | Auto re-attest when user restores to new iPhone |
 | Webhook Notifications | Get notified on config changes |
