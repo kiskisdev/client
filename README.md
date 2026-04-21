@@ -42,8 +42,9 @@ brew install kiskis
 ```swift
 import Kiskis
 
-// Only Team ID is required — Bundle ID and version are auto-detected
-let kiskis = KiskisClient(teamId: "A1B2C3D4E5")
+// Team ID + config key identify which document to fetch.
+// Bundle ID and app version are auto-detected.
+let kiskis = KiskisClient(teamId: "A1B2C3D4E5", key: "default")
 let config = try await kiskis.fetchConfig()
 let stripeKey = config.string("api_keys.stripe")
 ```
@@ -51,7 +52,7 @@ let stripeKey = config.string("api_keys.stripe")
 That single call:
 1. Registers the device via Apple App Attest (first launch only, 1-2 sec)
 2. Signs every request with the Secure Enclave (no tokens, no passwords)
-3. Fetches version-matched config from the Kiskis server
+3. Fetches the config document named `key`, version-matched to the running app
 4. Caches in encrypted local storage for offline use
 5. Refreshes silently in the background
 
@@ -60,11 +61,12 @@ That single call:
 | Parameter | Source | Can Override? |
 |-----------|--------|---------------|
 | Team ID | You provide it | Required |
+| Config key | You provide it | Required (e.g. `"default"`, `"flags"`) |
 | Bundle ID | `Bundle.main.bundleIdentifier` | Yes, pass `bundleId:` |
 | App Version | `CFBundleShortVersionString` in Info.plist | No (always auto-detected) |
 | Environment | `#if DEBUG` → sandbox, else production | Yes, pass `environment:` |
 
-Together Team ID + Bundle ID + Version form the **three-part config lookup key**.
+Together Team ID + Bundle ID + **key** + version form the config lookup. Each client instance is bound to one key — to read from a different config document (e.g., feature flags), create another `KiskisClient` with a different `key:`.
 
 ---
 
@@ -184,7 +186,7 @@ Secure Enclave signs request
 (local, <100ms, no network to Apple)
 
 Sends:
-  GET /config?version=2.1.3
+  GET /config?key=default&version=2.1.3
   X-Key-Id: abc123
   X-Assertion: <signed assertion>    ────────>  1. Look up public key by keyId
   X-Client-Data: <request hash>                 2. Verify assertion signature ✓
@@ -228,12 +230,13 @@ Sends:
 Developer                               Kiskis                          AWS
 ─────────                               ──────                          ───
 Signs up at kiskis.dev/dashboard
-Creates Kiskis key (kk_prod_...)
+Creates provisioning credential (kk_prod_...)
 Creates secrets.json on their machine
 Runs: kiskis-cli upload                 Management Lambda:
-  --file secrets.json                   1. Verify provisioning key
-  --key kk_prod_...                     2. Sign TeamID.BundleID → S3 path
-  --ver "*"                             3. Store config in S3 vault (encrypted)
+  --file secrets.json                   1. Verify provisioning credential
+  --auth kk_prod_...                    2. Sign TeamID.BundleID → S3 path
+  --ver "*"                             3. Store at {appHash}/keys/{key}/manifest.json
+  [--key flags]                         4. Encrypt at rest (KMS)
 ```
 
 ### Every App Launch
@@ -270,7 +273,7 @@ kiskis-cli upload --file new.json      Archives old version (rollback available)
 You don't implement any of this yourself. The SDK handles everything:
 
 ```swift
-let config = try await KiskisClient(teamId: "A1B2C3D4E5").fetchConfig()
+let config = try await KiskisClient(teamId: "A1B2C3D4E5", key: "default").fetchConfig()
 ```
 
 Behind that one line: key generation, attestation, assertion signing, version matching, caching, background refresh, device migration detection, offline fallback.
@@ -299,7 +302,7 @@ Kiskis: "Prove you're a real iPhone running the real app, using a key that physi
 |-------|-----------|
 | **S3 vault** | SSE-KMS encryption at rest, bucket policy denies all except Lambda |
 | **S3 paths** | Ed25519-signed hashes — impossible to guess or probe |
-| **Kiskis keys** | Only SHA-256 hash stored — raw key shown once at creation |
+| **Provisioning credentials** | Only SHA-256 hash stored — raw value shown once at creation |
 | **On-device cache** | iOS sandbox + NSFileProtectionComplete + excluded from backups |
 | **Zero-Knowledge** | AES-256-GCM client-side encryption — server cannot read secrets |
 
@@ -310,14 +313,13 @@ Kiskis: "Prove you're a real iPhone running the real app, using a key that physi
 ### Basic Usage
 
 ```swift
-// Only Team ID is required
-let kiskis = KiskisClient(teamId: "A1B2C3D4E5")
+// Team ID + config key identify the document to fetch.
+let kiskis = KiskisClient(teamId: "A1B2C3D4E5", key: "default")
 let config = try await kiskis.fetchConfig()
 
 // Access values by key path
 let stripe = config.string("api_keys.stripe")
-let maxMB = config.int("features.max_upload_mb")
-let dark = config.bool("features.dark_mode")
+let maxMB = config.int("limits.max_upload_mb")
 let pricing = config.array("pricing")
 let endpoints = config.dict("endpoints")
 ```
@@ -368,6 +370,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 ```swift
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
+    key: "default",
     fallbackConfig: Bundle.main.url(forResource: "fallback", withExtension: "json")
 )
 ```
@@ -413,6 +416,7 @@ fetchConfig() called
 ```swift
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
+    key: "default",
     cachePolicy: .init(
         maxStaleness: 7 * 24 * 3600,    // Trust cache 7 days offline
         backgroundRefresh: true,          // Silent updates when online
@@ -446,8 +450,7 @@ Your config is a JSON file you create. It can contain anything your app needs at
     "api": "https://api.myapp.com/v2",
     "cdn": "https://cdn.myapp.com"
   },
-  "features": {
-    "dark_mode": true,
+  "limits": {
     "max_upload_mb": 50
   },
   "images": {
@@ -517,12 +520,14 @@ with your vault password            blob in S3                       blob from s
 // Simple (plain password)
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
-    zeroKnowledge: .enabled(key: "MyVaultPassword")
+    key: "default",
+    zeroKnowledge: .enabled(vaultPass: "MyVaultPassword")
 )
 
 // Better (derived from multiple values — harder to extract from binary)
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
+    key: "default",
     zeroKnowledge: .derived(components: [
         .bundleId,              // "com.myapp.weather" — already in binary, not suspicious
         .buildNumber,           // "247" — changes each build
@@ -535,7 +540,7 @@ let kiskis = KiskisClient(
 ### CLI Upload
 
 ```bash
-kiskis-cli upload --file secrets.json --key kk_prod_... --ver "*" \
+kiskis-cli upload --file secrets.json --auth kk_prod_... --ver "*" \
   --encrypt --vault-pass "MyVaultPassword"
 ```
 
@@ -585,6 +590,145 @@ iPad   (user_id="usr_48291")  → reads from same hash     → gets {"theme":"da
 ### Apps Without User Login
 
 Use `identifierForVendor` (per-device ID). Data works on that device but won't sync to other devices.
+
+---
+
+## Feature Flags
+
+Kiskis is a feature flag system. Ship features dark, toggle them on/off, roll them out gradually — all without an app release. Same SDK you already use for API keys.
+
+### Why This Matters
+
+LaunchDarkly starts at $200/mo. Firebase Remote Config locks you into the Firebase ecosystem. Kiskis includes flags on every tier — free for 500 MAU (Hobby), $29/mo for 5,000 MAU (Indie) — and they work with the same config, same dashboard, same cache, same attestation.
+
+### The Simplest Flag
+
+Flags live in a dedicated config document under a key of your choosing — typically `"flags"`. Bind a `KiskisClient` instance to that key. **Flag names sit at the top level of the document** — there is no `features.` prefix.
+
+```json
+{
+  "dark_mode": true,
+  "new_checkout": false,
+  "beta_search": true
+}
+```
+
+In Swift, use a separate client bound to the `"flags"` key:
+
+```swift
+let flags = KiskisClient(teamId: "A1B2C3D4E5", key: "flags")
+_ = try await flags.fetchConfig()
+
+if flags.isEnabled("dark_mode") {
+    enableDarkMode()
+}
+
+if flags.isEnabled("new_checkout", default: false) {
+    showNewCheckout()
+}
+```
+
+`isEnabled("dark_mode")` reads the top-level `dark_mode` field of the flags document. The `default` value is returned if the config hasn't loaded yet (first launch offline). After the first successful fetch, flags work offline from cache.
+
+> **Why a separate client?** Each `KiskisClient` is bound to one config key. Your API keys (in `"default"`) and feature flags (in `"flags"`) are independent documents with independent version histories and kill switches. Use two clients — one per key.
+
+### Variants (Multi-Way Flags)
+
+Flags don't have to be booleans. Use strings for A/B tests or multi-way splits:
+
+```json
+{ "checkout_flow": "express" }
+```
+
+```swift
+switch flags.variant("checkout_flow", default: "classic") {
+case "express":  showExpressCheckout()
+case "onepage":  showOnePageCheckout()
+default:         showClassicCheckout()
+}
+```
+
+### Progressive Rollouts
+
+Enable a feature for a percentage of devices. The same device always gets the same answer for the same flag (deterministic hash of flag name + `identifierForVendor`):
+
+```swift
+// Ship to 25% of devices
+if flags.isInRollout("new_search", percentage: 25) {
+    useNewSearchAPI()
+}
+```
+
+Put the percentage in the flags document if you want to ramp from the dashboard without shipping an update:
+
+```swift
+let pct = (try await flags.fetchConfig()).int("new_search_rollout_pct") ?? 0
+if flags.isInRollout("new_search", percentage: pct) { ... }
+```
+
+### Kill Switch
+
+A flag goes wrong in production. Three ways to turn it off:
+
+1. **Flip in dashboard** — set `broken_thing` to `false` in the flags document, save. Online devices pick it up within the TTL (default 1 hour).
+2. **Pair with push** — `kiskis push:broadcast --auth $AUTH --silent --data '{"action":"refresh"}'` — every device refetches within seconds.
+3. **Version kill switch** — `POST /admin/kill-switch` disables config delivery for a specific key + version, forcing cached fallback.
+
+### Version-Targeted Flags
+
+Different flag values for different app versions (within the `flags` key):
+
+```bash
+kiskis upload --file v1-flags.json --auth $AUTH --key flags --ver "1.*"
+kiskis upload --file v2-flags.json --auth $AUTH --key flags --ver "2.*"
+```
+
+Useful when a feature depends on v2-only code. v1 users get the v1 file (flag off), v2 users get the v2 file (flag on).
+
+### Staff / Beta Overrides
+
+Enable a flag for specific users before rolling out widely:
+
+```swift
+// Global default lives in the flags document: "beta_search": false
+
+// Store per-user override via dashboard, CLI (`kiskis user:set`), or API
+try await flags.saveUserData(userId: "staff_alice", data: [
+    "feature_overrides": ["beta_search": true]
+])
+
+// In your app
+let userData = try await flags.loadUserData(userId: currentUserId)
+let override = (userData?["feature_overrides"] as? [String: Bool])?["beta_search"]
+let isOn = override ?? flags.isEnabled("beta_search")
+```
+
+### The Gradual Rollout Pattern
+
+Launch a feature safely in four steps:
+
+1. **Ship it dark.** Upload config with the flag `false`. Feature code is in the app but not reachable.
+2. **Enable for staff.** Per-user overrides for internal testers. Verify in production with real data.
+3. **5% rollout.** Monitor crash rates, latency, user feedback. If bad, flip to 0% — no release needed.
+4. **Ramp up.** 5% → 25% → 50% → 100% over days or weeks. Any issue, flip back.
+
+### Kiskis vs Dedicated Flag Services
+
+| Feature | Kiskis | LaunchDarkly | Firebase Remote Config |
+|---------|--------|--------------|------------------------|
+| Starter price | **$29/mo Indie** | $200+/mo | Free (Firebase lock-in) |
+| On/off flags | ✓ | ✓ | ✓ |
+| Variants / A/B | ✓ | ✓ | ✓ |
+| Progressive rollout | ✓ | ✓ | Limited |
+| Kill switch | ✓ | ✓ | ✓ |
+| Rollback history | ✓ | ✓ | Limited |
+| Hardware attestation | ✓ | ✗ | Partial |
+| Real-time updates | Push-triggered | SSE streaming | Polling |
+| Server-side rule engine | ✗ (client-side) | ✓ | ✓ |
+| Evaluation metrics | Your analytics | ✓ | ✓ |
+| Also delivers API keys | ✓ | ✗ | ✗ |
+
+**Use LaunchDarkly if** you need a server-side rule engine (target by country + subscription + custom attributes), formal A/B testing with outcome measurement, or built-in evaluation dashboards. **Use Kiskis if** you need on/off flags, variants, and gradual rollouts without enterprise pricing — and you want the same tool for API keys, config, and flags.
 
 ---
 
@@ -653,26 +797,26 @@ From your backend, the CLI, or the dashboard:
 
 ```bash
 # Silent push to all of a user's devices (cross-device sync)
-kiskis push:send --key $KEY --to "user_id" \
+kiskis push:send --auth $AUTH --to "user_id" \
   --silent --data '{"action": "sync"}'
 
 # Visible push to a single device
-kiskis push:send --key $KEY --device "keyId_abc" \
+kiskis push:send --auth $AUTH --device "keyId_abc" \
   --title "Update" --body "New data available"
 
 # Broadcast to all users
-kiskis push:broadcast --key $KEY \
+kiskis push:broadcast --auth $AUTH \
   --title "New feature!" --body "Dark mode is here"
 
 # Check delivery status
-kiskis push:status --key $KEY --id push_a7f3b9c2
+kiskis push:status --auth $AUTH --id push_a7f3b9c2
 ```
 
 Or use the REST API directly:
 
 ```bash
 curl -X POST https://api.kiskis.dev/push/send \
-  -H "Authorization: Bearer $KEY" \
+  -H "Authorization: Bearer $AUTH" \
   -H "Content-Type: application/json" \
   -d '{"to":"user_id","silent":true,"data":{"action":"sync"}}'
 ```
@@ -682,7 +826,7 @@ curl -X POST https://api.kiskis.dev/push/send \
 Kiskis needs your APNs `.p8` signing key to deliver pushes. Generate one in the [Apple Developer Portal](https://developer.apple.com/account/resources/authkeys/list) under Keys → Apple Push Notifications service.
 
 ```bash
-kiskis push:setup --key $KEY \
+kiskis push:setup --auth $AUTH \
   --apns-key-file AuthKey_XXXX.p8 \
   --apns-key-id XXXX \
   --apns-team-id YOUR_TEAM_ID
@@ -703,14 +847,40 @@ Broadcasts to 50,000+ devices use SQS fan-out: the API returns immediately with 
 
 ---
 
-## Version Matching
+## Key + Version
 
-Upload different configs for different app versions:
+Each app can hold multiple **named config documents** (identified by `key`), and each key has its **own independent** set of version-targeted payloads. The lookup is always `(key, version)`.
+
+### Multiple Keys per App
 
 ```bash
-kiskis-cli upload --file default.json --key kk_prod_... --ver "*"      # all versions
-kiskis-cli upload --file v2.json      --key kk_prod_... --ver "2.*"    # v2.x.x
-kiskis-cli upload --file hotfix.json  --key kk_prod_... --ver "2.1.3"  # exact
+# Main runtime config
+kiskis-cli upload --file config.json --auth kk_prod_... --ver "*"                  # key defaults to "default"
+
+# Feature flags document
+kiskis-cli upload --file flags.json  --auth kk_prod_... --ver "*" --key flags
+
+# Promotional copy
+kiskis-cli upload --file promos.json --auth kk_prod_... --ver "*" --key promos
+```
+
+Your SDK reads one key per `KiskisClient` instance:
+
+```swift
+let runtime = KiskisClient(teamId: "A1B2C3D4E5", key: "default")
+let flags   = KiskisClient(teamId: "A1B2C3D4E5", key: "flags")
+```
+
+Requesting a key that doesn't exist returns a 404. There is no fallback across keys.
+
+### Version Matching Within a Key
+
+Upload different configs for different app versions **within the same key**:
+
+```bash
+kiskis-cli upload --file default.json --auth kk_prod_... --ver "*"      # all versions
+kiskis-cli upload --file v2.json      --auth kk_prod_... --ver "2.*"    # v2.x.x
+kiskis-cli upload --file hotfix.json  --auth kk_prod_... --ver "2.1.3"  # exact
 ```
 
 Matching priority — **first match wins**:
@@ -722,7 +892,7 @@ Matching priority — **first match wins**:
 | 3 | `2.*` | Any 2.x.x |
 | 4 | `*` | All versions |
 
-Example: app v2.5.0 → checks `2.5.0`? no → `2.5.*`? no → `2.*`? yes → returns v2 config.
+Example: app v2.5.0 → checks `2.5.0`? no → `2.5.*`? no → `2.*`? yes → returns v2 config. Matching happens independently for each key.
 
 ---
 
@@ -734,15 +904,16 @@ Example: app v2.5.0 → checks `2.5.0`? no → `2.5.*`? no → `2.*`? yes → re
 - name: Deploy Config to Kiskis
   uses: kiskis/deploy-action@v1
   with:
-    api-key: ${{ secrets.KISKIS_PROVISIONING_KEY }}
+    auth: ${{ secrets.KISKIS_AUTH }}
     config-file: ./config/production.json
+    key: 'default'
     version: '*'
 ```
 
 ### Any CI System
 
 ```bash
-npx kiskis-cli upload --file config.json --key $KISKIS_KEY --ver "*"
+npx kiskis-cli upload --file config.json --auth $KISKIS_AUTH --ver "*"
 ```
 
 ---
@@ -763,7 +934,8 @@ do {
 } catch KiskisError.zeroKnowledgeDecryptionFailed {
     // Wrong vault password or tampered ciphertext
 } catch KiskisError.configNotFound {
-    // No config uploaded for this Team ID + Bundle ID + version
+    // No config uploaded for this Team ID + Bundle ID + key + version
+    // (404 when the requested key doesn't exist — no cross-key fallback)
 } catch KiskisError.blobDownloadFailed(let msg) {
     // Blob download error
 } catch KiskisError.blobIntegrityFailed(let msg) {
@@ -815,6 +987,7 @@ Release build (TestFlight/App Store):
 ```swift
 let kiskis = KiskisClient(
     teamId: "A1B2C3D4E5",
+    key: "default",
     environment: .production   // Override server detection (rare)
 )
 ```
@@ -841,6 +1014,7 @@ This is rarely needed — the server detection is authoritative and correct for 
 | Assertion Auth | No tokens — every request individually signed by hardware |
 | Version Targeting | Different configs for `2.1.3`, `2.*`, `*` |
 | Kill Switch | Instantly disable config delivery for specific versions |
+| Feature Flags | `isEnabled()`, `variant()`, `isInRollout()` — LaunchDarkly-style flags built in |
 | Canary Deployments | Roll out to 5% of devices, monitor, promote or rollback |
 | Config Versioning | Every change archived, rollback to any revision |
 | Zero-Knowledge Mode | Client-side AES-256-GCM — server can't read secrets |
@@ -856,11 +1030,15 @@ This is rarely needed — the server detection is authoritative and correct for 
 
 ## Pricing
 
+All features on every tier. Pay for scale of users, not the feature set.
+
 | Plan | Monthly Active Devices | Apps | Price |
 |------|----------------------|------|-------|
-| Free | 1,000 | 1 | $0/mo |
-| Pro | 50,000 | Unlimited | $15/mo |
-| Growth | Unlimited | Unlimited | $49/mo |
+| Hobby | 500 | 1 | $0/mo |
+| Indie | 5,000 | Unlimited | $29/mo |
+| Pro | 25,000 | Unlimited | $99/mo |
+| Growth | 100,000 | Unlimited | $249/mo |
+| Scale | 100k+ | Unlimited | Custom — [contact us](mailto:sales@kiskis.dev) |
 
 Kiskis counts unique **devices**, not users. One person with iPhone + iPad = 2 devices. For most apps, device count ≈ user count.
 

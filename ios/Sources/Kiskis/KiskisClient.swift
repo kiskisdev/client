@@ -130,6 +130,17 @@ public struct KiskisConfig: @unchecked Sendable {
     }
 }
 
+// MARK: - DeviceInfo
+
+/// Returned by `KiskisClient.deviceInfo()` — when this device first attested,
+/// and when it last made a request. Use for trial logic, tenure rewards, etc.
+public struct DeviceInfo: Sendable {
+    /// First attestation for this App Attest install. Resets on uninstall/reinstall.
+    public let firstSeen: Date
+    /// Most recent successful assertion from this device.
+    public let lastSeen: Date
+}
+
 // MARK: - Errors
 
 public enum KiskisError: Error, Sendable {
@@ -160,6 +171,10 @@ public final class KiskisClient: @unchecked Sendable {
 
     private let teamId: String
     private let bundleId: String
+    /// The configuration key (identifies which config document this client reads).
+    /// Default: "default". Other common values: "flags", "promos", "region_us".
+    /// Each key has its own cache, its own version history, its own kill switch.
+    public let configKey: String
     private let apiURL: URL
     private let cachePolicy: CachePolicy
     private let zeroKnowledge: ZeroKnowledgeMode
@@ -178,6 +193,7 @@ public final class KiskisClient: @unchecked Sendable {
     public init(
         teamId: String,
         bundleId: String? = nil,
+        key: String = "default",
         apiURL: URL = URL(string: "https://api.kiskis.dev")!,
         cachePolicy: CachePolicy = CachePolicy(),
         zeroKnowledge: ZeroKnowledgeMode = .disabled,
@@ -186,6 +202,7 @@ public final class KiskisClient: @unchecked Sendable {
     ) {
         self.teamId = teamId
         self.bundleId = bundleId ?? Bundle.main.bundleIdentifier ?? "unknown"
+        self.configKey = key
         self.apiURL = apiURL
         self.cachePolicy = cachePolicy
         self.zeroKnowledge = zeroKnowledge
@@ -207,12 +224,22 @@ public final class KiskisClient: @unchecked Sendable {
             #endif
         }
 
-        let keychainGroup = "kiskis.\(self.teamId).\(self.bundleId)"
+        // Cache is scoped per (teamId, bundleId, key) — multiple clients for the same
+        // app but different keys have independent caches.
+        // Why: a flag flip shouldn't invalidate the base config cache, and vice versa.
+        let keychainGroup = "kiskis.\(self.teamId).\(self.bundleId).\(self.configKey)"
         self.configCache = ConfigCache(keychainGroup: keychainGroup, cachePolicy: cachePolicy)
+        // AttestationManager is per-app (teamId+bundleId) — shared across all keys.
+        // Only the first client created for an app triggers attestation; subsequent
+        // clients reuse the keyId stored in the Keychain.
         self.attestationManager = AttestationManager(teamId: self.teamId, bundleId: self.bundleId)
         self.urlSession = URLSession(configuration: .ephemeral)
 
-        KiskisClient.shared = self
+        // Only set as shared if this is the "default" client (avoids overwriting
+        // with a flags-scoped client accidentally).
+        if self.configKey == "default" {
+            KiskisClient.shared = self
+        }
     }
 
     // MARK: - App Version
@@ -222,6 +249,13 @@ public final class KiskisClient: @unchecked Sendable {
     }
 
     // MARK: - Public API: Config
+
+    /// Return the currently cached config synchronously, without network I/O.
+    /// Used by feature flag helpers that need fast, non-async reads.
+    /// Returns nil if no config has ever been fetched (first launch offline, no fallback).
+    public func currentConfig() -> KiskisConfig? {
+        return configCache.load()
+    }
 
     /// Fetch the app's configuration.
     /// Handles attestation, assertion signing, caching, and background refresh automatically.
@@ -354,6 +388,51 @@ public final class KiskisClient: @unchecked Sendable {
         }
         return userData
     }
+
+    // MARK: - Public API: Device Info
+
+    /// Returns when this device first attested with Kiskis (`firstSeen`) and its last
+    /// assertion time (`lastSeen`). Useful for implementing trial logic, tenure badges,
+    /// welcome-back flows, or any policy based on "how long has this device been using
+    /// the app?" — without running your own backend to track install timestamps.
+    ///
+    /// Kiskis stays out of trial policy; you get the timestamps and decide what they
+    /// mean for your app. Example — a plan-dependent trial:
+    /// ```swift
+    /// let info = try await kiskis.deviceInfo()
+    /// let trialDays = userPlan == .pro ? 30 : 7
+    /// let trialEndsAt = info.firstSeen.addingTimeInterval(Double(trialDays) * 86400)
+    /// if Date() > trialEndsAt { showPaywall() }
+    /// ```
+    ///
+    /// Caveat: `firstSeen` is tied to this App Attest install. If the user uninstalls
+    /// and reinstalls, they get a new keyId and `firstSeen` resets. Apple designed
+    /// App Attest this way for privacy; there's no signal that survives reinstall.
+    /// For stronger anti-abuse, pair with StoreKit Introductory Offer limits (tied to
+    /// Apple ID) or your own user identity.
+    public func deviceInfo() async throws -> DeviceInfo {
+        let request = try await signedRequest(path: "device/info")
+        let (data, response) = try await urlSession.kiskisData(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw KiskisError.networkError("Failed to fetch device info")
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let firstSeenStr = json["first_seen"] as? String,
+              let lastSeenStr = json["last_seen"] as? String,
+              let firstSeen = Self.isoFormatter.date(from: firstSeenStr),
+              let lastSeen = Self.isoFormatter.date(from: lastSeenStr) else {
+            throw KiskisError.networkError("Invalid device info response")
+        }
+        return DeviceInfo(firstSeen: firstSeen, lastSeen: lastSeen)
+    }
+
+    /// ISO 8601 formatter for parsing timestamps from the Kiskis API.
+    /// Why static: reused across calls, expensive to construct.
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 
     // MARK: - Public API: Push Notification Registration
 
@@ -489,13 +568,13 @@ public final class KiskisClient: @unchecked Sendable {
     // MARK: - Internal: Config Fetch
 
     private func refreshConfigFromServer() async throws -> KiskisConfig {
-        var components = URLComponents(url: apiURL.appendingPathComponent("config"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "version", value: appVersion)]
+        // Send both key (which config document) and version (which variant within it).
+        let queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "key", value: configKey),
+            URLQueryItem(name: "version", value: appVersion),
+        ]
 
-        var request = try await signedRequest(
-            path: "config",
-            queryItems: [URLQueryItem(name: "version", value: appVersion)]
-        )
+        var request = try await signedRequest(path: "config", queryItems: queryItems)
 
         let (data, response) = try await urlSession.kiskisData(for: request)
 
@@ -509,10 +588,7 @@ public final class KiskisClient: @unchecked Sendable {
             attestationManager.clearKeyId()
             let _ = try await performAttestation()
             // Retry with fresh assertion
-            request = try await signedRequest(
-                path: "config",
-                queryItems: [URLQueryItem(name: "version", value: appVersion)]
-            )
+            request = try await signedRequest(path: "config", queryItems: queryItems)
             let (retryData, retryResponse) = try await urlSession.kiskisData(for: request)
             guard let retryHttp = retryResponse as? HTTPURLResponse, retryHttp.statusCode == 200 else {
                 throw KiskisError.attestationFailed("Re-attestation failed")
