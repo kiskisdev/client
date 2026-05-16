@@ -353,10 +353,10 @@ public final class KiskisClient: @unchecked Sendable {
         let jsonData = try JSONSerialization.data(withJSONObject: data)
         var request = try await signedRequest(
             path: "user/data",
-            queryItems: [URLQueryItem(name: "user_id", value: userId)]
+            queryItems: [URLQueryItem(name: "user_id", value: userId)],
+            method: "PUT",
+            body: jsonData
         )
-        request.httpMethod = "PUT"
-        request.httpBody = jsonData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let (_, response) = try await urlSession.kiskisData(for: request)
@@ -445,9 +445,7 @@ public final class KiskisClient: @unchecked Sendable {
     /// device, send a push to the userId so all other devices refresh immediately.
     public func setUserId(_ userId: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["user_id": userId])
-        var request = try await signedRequest(path: "push/register")
-        request.httpMethod = "POST"
-        request.httpBody = body
+        var request = try await signedRequest(path: "push/register", method: "POST", body: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let (_, response) = try await urlSession.kiskisData(for: request)
@@ -460,15 +458,43 @@ public final class KiskisClient: @unchecked Sendable {
 
     /// Build a request with assertion headers.
     /// Every protected request is signed by the Secure Enclave — no tokens.
+    /// Build the canonical request string that the server will reconstruct independently.
+    /// Format: "{METHOD}:{path}:{sorted_query}:{body_sha256_or_empty}"
+    /// Must match buildCanonicalClientData() in delivery/index.ts exactly.
+    private func canonicalClientData(
+        method: String,
+        path: String,
+        queryItems: [URLQueryItem],
+        body: Data?
+    ) -> String {
+        let sortedQuery = queryItems
+            .sorted { $0.name < $1.name }
+            .map { "\($0.name)=\($0.value ?? "")" }
+            .joined(separator: "&")
+        let bodyHash: String
+        if let body = body {
+            bodyHash = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+        } else {
+            bodyHash = ""
+        }
+        return "\(method):\(path):\(sortedQuery):\(bodyHash)"
+    }
+
     private func signedRequest(
         path: String,
-        queryItems: [URLQueryItem] = []
+        queryItems: [URLQueryItem] = [],
+        method: String = "GET",
+        body: Data? = nil
     ) async throws -> URLRequest {
         var components = URLComponents(url: apiURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         if !queryItems.isEmpty {
             components.queryItems = queryItems
         }
         var request = URLRequest(url: components.url!)
+        request.httpMethod = method
+        if let body = body {
+            request.httpBody = body
+        }
 
         // Why: #if DEBUG is evaluated at compile time. The bypass block is physically
         // absent from App Store / TestFlight builds — it cannot be triggered in
@@ -488,22 +514,29 @@ public final class KiskisClient: @unchecked Sendable {
         // Production path: full App Attest assertion
         let keyId = try await ensureRegistered()
 
-        // Client data = SHA256 of the request URL + current timestamp
-        let clientData = "\(components.url!.absoluteString)|\(Int(Date().timeIntervalSince1970))"
+        // Why: build canonical data server-side style so the server can reconstruct
+        // it independently from the actual request — never accepted from a header.
+        // Format must match buildCanonicalClientData() in delivery/index.ts exactly.
+        let signingPayload = canonicalClientData(
+            method: method,
+            path: components.path,
+            queryItems: components.queryItems ?? [],
+            body: body
+        )
 
         // Sign with Secure Enclave
         let assertionB64 = try await attestationManager.generateAssertion(
-            payload: Data(clientData.utf8),
+            payload: Data(signingPayload.utf8),
             keyId: keyId
         )
 
-        // Set assertion headers
+        // Set assertion headers — X-Client-Data is intentionally omitted;
+        // the server reconstructs canonical data from the request itself.
         request.setValue(keyId, forHTTPHeaderField: "X-Key-Id")
         request.setValue(teamId, forHTTPHeaderField: "X-Team-Id")
         request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         request.setValue(environment == .sandbox ? "sandbox" : "production", forHTTPHeaderField: "X-Environment")
         request.setValue(assertionB64, forHTTPHeaderField: "X-Assertion")
-        request.setValue(clientData, forHTTPHeaderField: "X-Client-Data")
 
         // Include push token if available (for registration/updates)
         if let pushToken = pushToken {
@@ -628,35 +661,43 @@ public final class KiskisClient: @unchecked Sendable {
     }
 
     private func processConfigResponse(_ data: Data) throws -> KiskisConfig {
-        var configData = data
-
-        // Zero-knowledge: decrypt locally
-        if let vaultKey = zeroKnowledge.resolvedKey {
-            guard let decrypted = ZeroKnowledgeCrypto.decrypt(data: data, key: vaultKey) else {
-                throw KiskisError.zeroKnowledgeDecryptionFailed
-            }
-            configData = decrypted
-        }
-
-        guard let responseJson = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
+        // Always parse the outer JSON envelope first.
+        guard let responseJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw KiskisError.serverError(200, "Invalid JSON")
         }
 
-        // Server returns { "config": {...}, "matchedPattern": "2.*" }
+        // Server returns { "config": <value>, "matchedPattern": "2.*", ... }
         let configDict: [String: Any]
-        if let inner = responseJson["config"] as? [String: Any] {
-            configDict = inner
+
+        if let vaultKey = zeroKnowledge.resolvedKey {
+            // Why: ZK upload path — CLI encrypts the plaintext JSON with AES-256-GCM
+            // and base64-encodes the binary before sending it. The server stores that
+            // base64 string as the config value and returns it verbatim in `config`.
+            // We must: (1) extract the base64 string, (2) decode to binary,
+            // (3) decrypt to get the original plaintext JSON, (4) parse that.
+            // Decrypting `data` directly (the full HTTP response JSON) was incorrect —
+            // that bytestream is not the binary ciphertext.
+            guard let ciphertextB64 = responseJson["config"] as? String,
+                  let ciphertextData = Data(base64Encoded: ciphertextB64),
+                  let decrypted = ZeroKnowledgeCrypto.decrypt(data: ciphertextData, key: vaultKey),
+                  let decryptedDict = try? JSONSerialization.jsonObject(with: decrypted) as? [String: Any] else {
+                throw KiskisError.zeroKnowledgeDecryptionFailed
+            }
+            configDict = decryptedDict
         } else {
-            configDict = responseJson
+            // Standard mode: config is a JSON object inline in the response.
+            if let inner = responseJson["config"] as? [String: Any] {
+                configDict = inner
+            } else {
+                configDict = responseJson
+            }
         }
 
         let config = KiskisConfig(data: configDict, isCached: false, isStale: false, fetchedAt: Date())
 
-        // Cache
+        // Cache the parsed config dict (not the raw response, which for ZK is the encrypted envelope)
         if let innerData = try? JSONSerialization.data(withJSONObject: configDict) {
             configCache.save(data: innerData)
-        } else {
-            configCache.save(data: configData)
         }
 
         return config
