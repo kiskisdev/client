@@ -996,13 +996,101 @@ This is rarely needed — the server detection is authoritative and correct for 
 
 ## Testing
 
-| Environment | Secure Enclave | Apple Attestation | Server Detects |
-|-------------|----------------|-------------------|----------------|
-| Xcode Simulator | No (mocked) | Sandbox | `sandbox` |
-| Physical device (debug) | Yes | Sandbox | `sandbox` |
-| Physical device (release) | Yes | Production | `.production` |
-| TestFlight | Yes | Production | `.production` |
-| App Store | Yes | Production | `.production` |
+### Testing Matrix
+
+| Environment | Secure Enclave | Bypass Secret | App Attest |
+|-------------|----------------|---------------|-----------|
+| Xcode Simulator | No — not supported | Use bypass secret | N/A |
+| Physical device (debug build) | Yes | Optional | Sandbox |
+| Physical device (release build) | Yes | No — compiled out | Production |
+| TestFlight | Yes | No — compiled out | Production |
+| App Store | Yes | No — compiled out | Production |
+
+### Simulator & CI: The Bypass Secret
+
+iOS Simulator has no Secure Enclave. Apple App Attest requires hardware attestation — it cannot run in the Simulator or on Linux CI runners (GitHub Actions, Bitrise, etc.). Without a solution, `fetchConfig()` throws `attestationUnavailable` in every simulator run.
+
+The **bypass secret** solves this. It is a per-team credential that lets `#if DEBUG` SDK builds skip App Attest and authenticate via a shared secret instead.
+
+**Security guarantee:** The bypass path is wrapped in `#if DEBUG`, a Swift compile-time flag. It is physically absent from App Store and TestFlight builds. An attacker who obtains the bypass secret cannot use it in production because the code to send it does not exist in the release binary.
+
+#### How It Works
+
+```
+Simulator / CI:
+  SDK reads KISKIS_BYPASS_SECRET from process environment
+  → sends X-Bypass-Token: <secret>, X-Team-Id, X-Bundle-Id headers
+  → server looks up SHA-256(secret) in DynamoDB under BYPASS#{teamId}
+  → if match: returns config (authenticated as simulator for this team)
+  → if no match: falls through to assertion verification → 401
+
+Real device (any build configuration):
+  Normal App Attest assertion flow — bypass code does not execute
+```
+
+#### Step 1: Generate a Bypass Secret
+
+In the Kiskis dashboard, go to the **Keys** tab and scroll to the **Developer Bypass Secret** section. Enter your Apple Team ID and click **Generate Secret**.
+
+The raw secret (`kk_dev_...`) is shown once and never stored server-side. Copy it immediately.
+
+Alternatively, use the CLI:
+
+```bash
+# Not yet available — use the dashboard for now
+```
+
+#### Step 2: Configure Xcode Simulator
+
+Open your scheme editor: **Product → Scheme → Edit Scheme → Run → Arguments → Environment Variables**.
+
+Add a new environment variable:
+
+| Name | Value |
+|------|-------|
+| `KISKIS_BYPASS_SECRET` | `kk_dev_your_secret_here` |
+
+The SDK reads this variable at runtime. Your Simulator builds will now fetch real config from the server, exactly as a real device would.
+
+#### Step 3: Configure GitHub Actions / CI
+
+Add the secret to your repository: **Settings → Secrets and variables → Actions → New repository secret**.
+
+Name: `KISKIS_BYPASS_SECRET`
+Value: `kk_dev_your_secret_here`
+
+Then pass it as an environment variable in your workflow step:
+
+```yaml
+- name: Run tests
+  env:
+    KISKIS_BYPASS_SECRET: ${{ secrets.KISKIS_BYPASS_SECRET }}
+  run: xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+#### Step 4: No SDK Changes Needed
+
+The SDK automatically detects `KISKIS_BYPASS_SECRET` in the process environment. No code changes are required — the same `fetchConfig()` call that works on a real device also works in the Simulator once the env var is set.
+
+```swift
+// This exact code works identically on a real device AND in the Simulator
+// (with KISKIS_BYPASS_SECRET set in the scheme environment)
+let kiskis = KiskisClient(teamId: "A1B2C3D4E5", bundleId: "com.myapp.weather")
+let config = try await kiskis.fetchConfig()
+```
+
+#### Revoking a Bypass Secret
+
+If a bypass secret is compromised, revoke it immediately from the dashboard (**Keys → Developer Bypass Secret → Revoke Secret**). The revocation is instant — the DynamoDB item is deleted and any subsequent request with the old secret falls through to assertion verification, which fails (no Secure Enclave on the simulator).
+
+After revoking, generate a new secret and update your Xcode scheme and CI secrets.
+
+#### What the Bypass Does NOT Do
+
+- It does not affect App Store or TestFlight builds (compiled out by `#if DEBUG`).
+- It does not bypass rate limiting or billing — requests are counted normally.
+- It does not grant access to other teams' data — the secret is scoped to a specific Apple Team ID.
+- It does not enable Zero-Knowledge decryption — the SDK still needs the vault key you provided for that.
 
 ---
 
@@ -1027,6 +1115,7 @@ This is rarely needed — the server detection is authoritative and correct for 
 | Device Migration | Auto re-attest when user restores to new iPhone |
 | Webhook Notifications | Get notified on config changes |
 | Coupon System | Discount codes for billing |
+| Simulator / CI Bypass | `#if DEBUG` bypass secret — skip App Attest in Simulator and CI without changing code |
 
 ## Pricing
 

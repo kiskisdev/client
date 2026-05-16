@@ -464,13 +464,29 @@ public final class KiskisClient: @unchecked Sendable {
         path: String,
         queryItems: [URLQueryItem] = []
     ) async throws -> URLRequest {
-        let keyId = try await ensureRegistered()
-
         var components = URLComponents(url: apiURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         if !queryItems.isEmpty {
             components.queryItems = queryItems
         }
         var request = URLRequest(url: components.url!)
+
+        // Why: #if DEBUG is evaluated at compile time. The bypass block is physically
+        // absent from App Store / TestFlight builds — it cannot be triggered in
+        // production even if an attacker obtains the bypass secret.
+        #if DEBUG
+        if let bypassSecret = ProcessInfo.processInfo.environment["KISKIS_BYPASS_SECRET"] {
+            // Bypass path: send the secret instead of an App Attest assertion.
+            // The server verifies the secret against a SHA-256 hash in DynamoDB and,
+            // if valid, treats the request as authenticated for this (teamId, bundleId).
+            request.setValue(bypassSecret, forHTTPHeaderField: "X-Bypass-Token")
+            request.setValue(teamId, forHTTPHeaderField: "X-Team-Id")
+            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+            return request
+        }
+        #endif
+
+        // Production path: full App Attest assertion
+        let keyId = try await ensureRegistered()
 
         // Client data = SHA256 of the request URL + current timestamp
         let clientData = "\(components.url!.absoluteString)|\(Int(Date().timeIntervalSince1970))"
@@ -500,6 +516,14 @@ public final class KiskisClient: @unchecked Sendable {
     /// Ensure the device is registered (attested). Returns the keyId.
     /// First launch: performs attestation. Subsequent: returns stored keyId.
     private func ensureRegistered() async throws -> String {
+        #if DEBUG
+        // Bypass mode: no Secure Enclave needed. Return a dummy keyId; the server
+        // identifies the request by the X-Bypass-Token header instead.
+        if ProcessInfo.processInfo.environment["KISKIS_BYPASS_SECRET"] != nil {
+            return "bypass-simulator"
+        }
+        #endif
+
         // Already registered?
         if let keyId = attestationManager.storedKeyId {
             return keyId
