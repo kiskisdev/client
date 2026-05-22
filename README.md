@@ -544,6 +544,19 @@ kiskis-cli upload --file secrets.json --auth kk_prod_... --ver "*" \
   --encrypt --vault-pass "MyVaultPassword"
 ```
 
+### When to use Zero-Knowledge Mode
+
+**Use ZK mode for any secret where a mass leak would be catastrophic.**
+
+In Standard mode, your configs are encrypted at rest in S3 with KMS, and only the Lambda role can read them. That's strong protection — but a sufficiently sophisticated attacker who compromises the Kiskis backend (AI-assisted exploit, supply chain attack, credential leak) could exfiltrate plaintext configs across all customers simultaneously. The Lambda role can read S3, so anything it can access, a compromised Lambda can send out.
+
+Zero-Knowledge mode eliminates that risk entirely. Even a complete backend compromise — every Lambda, every S3 bucket, every employee credential — yields nothing but encrypted garbage. The math won't allow it.
+
+Practical guidance:
+- **Stripe live keys, OpenAI keys, payment credentials** → ZK mode. A mass leak means every customer's payment integration is compromised at once.
+- **Feature flags, API endpoints, non-secret config** → Standard mode is fine. Losing these in a breach is annoying, not catastrophic.
+- **The binary key trade-off**: In ZK mode the decryption key lives in your app binary. A targeted reverse-engineering attack against *your specific app* can extract it. This is a different threat profile — laborious, per-app, doesn't scale. The backend attack ZK defends against *does* scale: one exploit, every customer.
+
 ### Tradeoffs
 
 | Feature | Standard Mode | Zero-Knowledge Mode |
