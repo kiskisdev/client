@@ -2,36 +2,40 @@ import XCTest
 @testable import Kiskis
 
 final class KiskisTests: XCTestCase {
+    // Stable test identity values — must match across encrypt/decrypt within each test.
+    private let testTeamId = "TEST1234AB"
+    private let testBundleId = "com.test.kiskis"
+
     func testZeroKnowledgeRoundTrip() throws {
         let plaintext = Data("{\"stripe_key\":\"sk_test_123\"}".utf8)
         let password = "MyVaultKey"
 
-        let encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: password)
+        let encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: password, teamId: testTeamId, bundleId: testBundleId)
         XCTAssertNotNil(encrypted, "Encryption should succeed")
         XCTAssertNotEqual(encrypted, plaintext, "Encrypted data should differ from plaintext")
 
-        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted!, key: password)
+        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted!, key: password, teamId: testTeamId, bundleId: testBundleId)
         XCTAssertNotNil(decrypted, "Decryption should succeed")
         XCTAssertEqual(decrypted, plaintext, "Decrypted data should match original")
     }
 
     func testZeroKnowledgeWrongKey() throws {
         let plaintext = Data("{\"key\":\"value\"}".utf8)
-        let encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: "CorrectKey")
+        let encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: "CorrectKey", teamId: testTeamId, bundleId: testBundleId)
         XCTAssertNotNil(encrypted)
 
-        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted!, key: "WrongKey")
+        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted!, key: "WrongKey", teamId: testTeamId, bundleId: testBundleId)
         XCTAssertNil(decrypted, "Decryption with wrong key should fail")
     }
 
     func testZeroKnowledgeTamperedData() throws {
         let plaintext = Data("{\"key\":\"value\"}".utf8)
-        var encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: "MyKey")!
+        var encrypted = ZeroKnowledgeCrypto.encrypt(data: plaintext, key: "MyKey", teamId: testTeamId, bundleId: testBundleId)!
 
         // Tamper with ciphertext (byte 15, which is in the ciphertext portion)
         encrypted[15] ^= 0xFF
 
-        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted, key: "MyKey")
+        let decrypted = ZeroKnowledgeCrypto.decrypt(data: encrypted, key: "MyKey", teamId: testTeamId, bundleId: testBundleId)
         XCTAssertNil(decrypted, "Decryption of tampered data should fail (GCM auth tag)")
     }
 

@@ -1,5 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy manifest audit — verified correct as of the current source.
+  Re-audit whenever new APIs or data-collection logic are added.
+
+  NSPrivacyAccessedAPITypes is EMPTY — required-reason API audit:
+    UserDefaults              — not used
+    File timestamp APIs       — not used (FileManager is used for read/write/delete
+                                but no creationDate/modificationDate reads)
+    System boot time          — not used (no systemUptime, mach_absolute_time, etc.)
+    Disk space APIs           — not used (no volumeAvailableCapacity, etc.)
+    Active keyboard           — not used (no UITextInputMode.activeInputModes)
+
+  NSPrivacyCollectedDataTypes is EMPTY — data collection audit:
+    identifierForVendor       — used in FeatureFlags.swift:stableDeviceId() to derive
+                                a local rollout bucket via SHA-256. The raw identifier
+                                never leaves the device; only the boolean bucket result
+                                is used in-process. Not "collected" under Apple's definition.
+    UIDevice.model/           — used in DeviceCheckFallback.swift:deviceFingerprint().
+      systemVersion/            This path is blocked by default (AttestationPolicy
+      systemName                .requireAppAttest) and the DeviceCheck attestation
+                                object is rejected by the server's CBOR verifier anyway.
+                                These are non-unique device characteristics, not PII.
+
+  NSPrivacyTracking is false — the SDK does not perform cross-app tracking.
+  The keyId (App Attest key) is device-scoped and not shared across vendors.
+-->
 <plist version="1.0">
 <dict>
     <key>NSPrivacyTracking</key>

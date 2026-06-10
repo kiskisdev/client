@@ -4,12 +4,17 @@ import Foundation
 ///
 /// Storage layers:
 /// - **In-memory**: holds the current config for instant repeated access within a session
-/// - **File system**: persists config to the app's Caches directory with NSFileProtectionComplete
-///   (encrypted by iOS when the device is locked)
+/// - **File system**: persists config under Library/Application Support with the file-protection
+///   class specified by `CachePolicy.fileProtection` (default: `NSFileProtectionComplete`).
+///   **Important:** `.complete` means the disk cache is unreadable while the device is locked.
+///   Background refresh tasks and locked-state reads fall through to a full network fetch.
+///   Use `CacheFileProtection.untilFirstUserAuthentication` if you need background reads to
+///   hit the cache.
 /// - **Keychain**: stores ONLY the keyId and attestation credentials (small, sensitive)
 ///
 /// For developers who need stronger encryption, Zero-Knowledge mode encrypts the config
-/// with AES-256-GCM before it ever reaches the cache.
+/// with AES-256-GCM before it ever reaches the cache. In ZK mode the disk cache holds
+/// the server ciphertext; plaintext is kept in the in-process memory cache only.
 final class ConfigCache: @unchecked Sendable {
     private let cacheDir: URL
     private let configFile: URL
@@ -39,15 +44,15 @@ final class ConfigCache: @unchecked Sendable {
         resourceValues.isExcludedFromBackup = true
         try? dir.setResourceValues(resourceValues)
 
-        // Set NSFileProtectionComplete — iOS encrypts files when device is locked
-        try? (cacheDir as NSURL).setResourceValue(
-            URLFileProtection.complete,
-            forKey: .fileProtectionKey
-        )
+        // Why: the directory-level fileProtectionKey is NOT set here. Setting it on a
+        // directory only affects files created without explicit write options, and every
+        // write in this class passes the appropriate Data.WritingOptions flag derived from
+        // CachePolicy.fileProtection. A directory-level call would be a no-op here and
+        // misleadingly suggest it's doing the protecting work.
     }
 
-    /// Load cached config. Returns nil if no cache exists.
-    /// Sets `isStale` if past TTL but within maxStaleness.
+    /// Load cached config. Returns nil if no cache exists or if disk holds ZK ciphertext
+    /// (caller must use loadEncryptedRaw() + decrypt for the cold-start ZK path).
     func load() -> KiskisConfig? {
         // Level 1: in-memory (instant)
         if let cached = memoryCache {
@@ -71,7 +76,9 @@ final class ConfigCache: @unchecked Sendable {
             }
         }
 
-        // Level 2: file system
+        // Level 2: file system — skip if disk holds ZK ciphertext.
+        // KiskisClient uses loadEncryptedRaw() to handle that path.
+        if readMetadata()?.isEncrypted == true { return nil }
         guard FileManager.default.fileExists(atPath: configFile.path) else {
             return nil
         }
@@ -109,10 +116,10 @@ final class ConfigCache: @unchecked Sendable {
         return config
     }
 
-    /// Save config data to the file cache and memory.
+    /// Save plaintext config data to file cache and memory.
     func save(data: Data, ttl: TimeInterval = 3600) {
         // Write config data to file
-        try? data.write(to: configFile, options: [.atomic, .completeFileProtection])
+        try? data.write(to: configFile, options: writeOptions())
 
         // Write metadata
         let metadata = CacheMetadata(
@@ -121,7 +128,7 @@ final class ConfigCache: @unchecked Sendable {
             sizeBytes: data.count
         )
         if let metadataData = try? JSONEncoder().encode(metadata) {
-            try? metadataData.write(to: metadataFile, options: [.atomic, .completeFileProtection])
+            try? metadataData.write(to: metadataFile, options: writeOptions())
         }
 
         // Update memory cache
@@ -135,6 +142,44 @@ final class ConfigCache: @unchecked Sendable {
         }
     }
 
+    /// Save ZK-mode config: ciphertext goes to disk, plaintext stays in memory only.
+    /// On the cold-start read path, use loadEncryptedRaw() + decrypt rather than load().
+    func saveEncrypted(ciphertextData: Data, plaintextData: Data, ttl: TimeInterval = 3600) {
+        // Why: ZK guarantee — disk holds ciphertext only; an attacker with file access
+        // cannot read secrets while the device is unlocked without also having the vault key.
+        try? ciphertextData.write(to: configFile, options: writeOptions())
+
+        let metadata = CacheMetadata(
+            timestamp: Date().timeIntervalSince1970,
+            ttl: ttl,
+            sizeBytes: ciphertextData.count,
+            isEncrypted: true
+        )
+        if let metadataData = try? JSONEncoder().encode(metadata) {
+            try? metadataData.write(to: metadataFile, options: writeOptions())
+        }
+
+        // Memory cache holds decrypted config — in-process only, cleared on app termination.
+        if let json = try? JSONSerialization.jsonObject(with: plaintextData) as? [String: Any] {
+            memoryCache = KiskisConfig(data: json, isCached: false, isStale: false, fetchedAt: Date())
+        }
+    }
+
+    /// Return the raw ciphertext bytes from disk for the ZK cold-start decrypt path.
+    /// Returns nil if the cache is absent, not encrypted, or beyond maxStaleness.
+    func loadEncryptedRaw() -> (data: Data, fetchedAt: Date, ttl: TimeInterval)? {
+        guard let metadata = readMetadata(), metadata.isEncrypted else { return nil }
+        guard FileManager.default.fileExists(atPath: configFile.path),
+              let data = try? Data(contentsOf: configFile) else { return nil }
+        let fetchedAt = Date(timeIntervalSince1970: metadata.timestamp)
+        let age = Date().timeIntervalSince(fetchedAt)
+        guard age <= cachePolicy.maxStaleness else {
+            clear()
+            return nil
+        }
+        return (data, fetchedAt, metadata.ttl)
+    }
+
     /// Clear both memory and file cache.
     func clear() {
         memoryCache = nil
@@ -143,6 +188,16 @@ final class ConfigCache: @unchecked Sendable {
     }
 
     // MARK: - Private
+
+    /// Convert the policy's file-protection level to Data write options.
+    private func writeOptions() -> Data.WritingOptions {
+        switch cachePolicy.fileProtection {
+        case .complete:
+            return [.atomic, .completeFileProtection]
+        case .untilFirstUserAuthentication:
+            return [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+        }
+    }
 
     private func readTTL() -> TimeInterval {
         return readMetadata()?.ttl ?? 3600
@@ -158,4 +213,26 @@ private struct CacheMetadata: Codable {
     let timestamp: TimeInterval
     let ttl: TimeInterval
     let sizeBytes: Int
+    let isEncrypted: Bool
+
+    init(timestamp: TimeInterval, ttl: TimeInterval, sizeBytes: Int, isEncrypted: Bool = false) {
+        self.timestamp = timestamp
+        self.ttl = ttl
+        self.sizeBytes = sizeBytes
+        self.isEncrypted = isEncrypted
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case timestamp, ttl, sizeBytes, isEncrypted
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try c.decode(TimeInterval.self, forKey: .timestamp)
+        ttl = try c.decode(TimeInterval.self, forKey: .ttl)
+        sizeBytes = try c.decode(Int.self, forKey: .sizeBytes)
+        // Why: old cache files written before ZK-cache landed don't have this field;
+        // default to false so existing plaintext caches are read correctly on upgrade.
+        isEncrypted = try c.decodeIfPresent(Bool.self, forKey: .isEncrypted) ?? false
+    }
 }

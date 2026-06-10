@@ -293,8 +293,8 @@ Kiskis: "Prove you're a real iPhone running the real app, using a key that physi
 | Layer | Mechanism | What It Proves |
 |-------|-----------|---------------|
 | Hardware | App Attest assertion (Secure Enclave) | Genuine device + unmodified app |
-| Replay Prevention | signCount (increments every request) | Each request is unique |
-| Transport | TLS 1.3 | Encrypted in transit |
+| Replay Prevention | signCount (increments every request) + 5-minute timestamp window | Each request is unique and time-bounded |
+| Transport | TLS 1.3 + Cloudflare intermediate CA pinning | Encrypted in transit, custom trust anchors rejected |
 
 ### Data Protection
 
@@ -303,8 +303,30 @@ Kiskis: "Prove you're a real iPhone running the real app, using a key that physi
 | **S3 vault** | SSE-KMS encryption at rest, bucket policy denies all except Lambda |
 | **S3 paths** | Ed25519-signed hashes — impossible to guess or probe |
 | **Provisioning credentials** | Only SHA-256 hash stored — raw value shown once at creation |
-| **On-device cache** | iOS sandbox + NSFileProtectionComplete + excluded from backups |
-| **Zero-Knowledge** | AES-256-GCM client-side encryption — server cannot read secrets |
+| **On-device cache** | iOS sandbox + configurable file protection class + excluded from backups |
+| **Zero-Knowledge** | AES-256-GCM client-side encryption — server cannot read secrets; disk cache stores ciphertext only |
+
+### Defense in Depth
+
+These protections were designed, reviewed, and hardened. The short version of what was considered:
+
+**Replay attacks.** Every assertion covers a canonical string that includes the HTTP method, path, query parameters, request body hash, your Team ID, and a Unix timestamp. The server rejects requests outside a 5-minute window and uses an atomic counter update to close the sub-millisecond TOCTOU race between checking and writing the App Attest signCount.
+
+**Zero-Knowledge integrity.** ZK mode uses a per-customer HKDF salt derived from your Team ID and Bundle ID — two apps using the same vault password produce completely different encryption keys. The on-device cache stores only ciphertext; plaintext exists in process memory only for the lifetime of the session.
+
+**Attestation policy.** The SDK defaults to `.requireAppAttest` and refuses to fall back to DeviceCheck. You can opt into DeviceCheck fallback explicitly, but ZK mode always overrides this and forces App Attest regardless — a weaker device cannot receive your encrypted secrets. Stale DeviceCheck key IDs from before this policy are detected and cleared at startup.
+
+**Blob integrity.** Downloaded blobs are SHA-256 verified by default. If a blob entry in your config omits a hash, the SDK refuses the download rather than trusting it blind. Verification streams through the file in 256 KB chunks so a 1 GB ML model doesn't spike RAM.
+
+**Keychain write failures.** Silent Keychain failures would cause re-attestation on every launch and eventually wedge a device against Apple's key-generation rate limit. Write failures are now surfaced as `KiskisError.keychainWriteFailed(OSStatus)` so you can observe and log them. The most common cause (`errSecInteractionNotAllowed` = device locked during a background write) is called out by name.
+
+**Cache file protection.** The default (`NSFileProtectionComplete`) means the disk cache is unreadable while the device is locked, which breaks background refresh. This trade-off is documented and configurable: pass `cachePolicy: CachePolicy(fileProtection: .untilFirstUserAuthentication)` to allow background tasks to read cached config without weakening cold-boot protection.
+
+**Bundled fallback files are plaintext in the IPA.** The `fallbackConfig:` parameter exists for offline first-launch resilience — feature flags and UI defaults, not secrets. The API surface, doc comments, and README all call this out explicitly.
+
+**Version-targeted config is not secret-gated.** The `?version=` parameter is self-reported by the client SDK. App Attest proves the device and binary are genuine; it does not cryptographically verify the version string. Use version patterns for feature flags and non-sensitive defaults, never to gate access to secrets.
+
+**Privacy manifest.** The SDK uses no required-reason APIs (no UserDefaults, no file timestamp reads, no system boot time, no disk space queries, no active keyboard reads). `identifierForVendor` is used client-side only to derive rollout buckets — the raw value never leaves the device. The `PrivacyInfo.xcprivacy` manifest is empty and verified correct; the reasoning is documented inline for future maintainers.
 
 ---
 
@@ -375,7 +397,16 @@ let kiskis = KiskisClient(
 )
 ```
 
-> **Warning:** Fallback configs are embedded in the binary. Never put API keys in the fallback — only non-sensitive defaults (endpoints, feature flags).
+> **WARNING: Never put secrets in a fallback file.**
+>
+> Bundle resources are plaintext inside the IPA. Anyone who downloads your app and
+> unpacks the archive can read every byte of the fallback file — there is no
+> encryption path for bundled resources, and no App Attest gate protects them.
+>
+> Use the fallback only for values that are safe to be fully public: feature flags,
+> UI copy, non-secret endpoint URLs, default thresholds. API keys, tokens, signing
+> secrets, and any value that must stay confidential must come from the server.
+> The whole point of Kiskis is that secrets never live in the binary.
 
 ---
 
@@ -604,6 +635,21 @@ iPad   (user_id="usr_48291")  → reads from same hash     → gets {"theme":"da
 
 Use `identifierForVendor` (per-device ID). Data works on that device but won't sync to other devices.
 
+### Device-User Binding
+
+The first `userId` a device uses is permanently bound to that device's App Attest key. Every subsequent call — `saveUserData`, `loadUserData`, and `setUserId` — must present the same `userId` or the server returns a 403.
+
+```
+Device installs → calls saveUserData(userId: "usr_48291") → bound to "usr_48291"
+Same device     → calls saveUserData(userId: "usr_99999") → 403 Forbidden
+```
+
+**This is intentional.** It prevents a genuine device from reading or writing another user's data by supplying a different identifier. App Attest proves the device is real; this binding proves it's acting on behalf of the same user it always has.
+
+**User logs out and logs in as someone else:** the device is already bound. The new user will get a 403 until the app is reinstalled (which generates a fresh App Attest key). If your app supports account switching, call `setUserId` once at first login and do not change it on that install.
+
+**Cross-device sync still works:** a second device with no prior binding can freely claim the same `userId` and read the same data. Binding blocks *switching*, not *sharing*.
+
 ---
 
 ## Feature Flags
@@ -697,6 +743,8 @@ kiskis upload --file v2-flags.json --auth $AUTH --key flags --ver "2.*"
 ```
 
 Useful when a feature depends on v2-only code. v1 users get the v1 file (flag off), v2 users get the v2 file (flag on).
+
+Note: version is client-asserted (see the warning in Version Matching above). Use version targeting for flags and defaults, never for secrets.
 
 ### Staff / Beta Overrides
 
@@ -799,7 +847,9 @@ func application(_ application: UIApplication,
 **4. Associate users with devices:**
 
 ```swift
-// After user logs in — enables cross-device push targeting
+// After user logs in — enables cross-device push targeting.
+// Call once per install. This permanently binds the device to this userId;
+// subsequent calls with a different userId return 403 (see Device-User Binding).
 let recordID = try await CKContainer.default().userRecordID()
 try await kiskis.setUserId(recordID.recordName)
 ```
@@ -906,6 +956,23 @@ Matching priority — **first match wins**:
 | 4 | `*` | All versions |
 
 Example: app v2.5.0 → checks `2.5.0`? no → `2.5.*`? no → `2.*`? yes → returns v2 config. Matching happens independently for each key.
+
+> **WARNING: Version is client-asserted — never gate secrets on it.**
+>
+> App Attest proves the device is genuine Apple hardware running an unmodified binary.
+> It does NOT prove the version number: the `?version=` value comes from
+> `Bundle.main.infoDictionary` on the client, and the server has no cryptographic
+> receipt for it. A device can claim any version and receive that variant's payload.
+>
+> Version patterns are safe for non-security decisions:
+> - Feature flags that enable/disable version-specific UI
+> - Config that references v2-only code paths
+> - Non-sensitive defaults that differ between releases
+>
+> Never put API keys, tokens, signing secrets, or any confidential value in a
+> version-specific variant expecting that older-version devices won't receive it.
+> If you need to deliver different secrets to different cohorts, provision separate
+> config keys per cohort and control access at the key level.
 
 ---
 

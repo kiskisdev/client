@@ -25,8 +25,14 @@ final class AttestationManager: @unchecked Sendable {
     }
 
     /// Save the key ID after successful attestation.
-    func saveKeyId(_ keyId: String) {
-        KeychainHelper.save(key: keychainKeyIdKey, value: keyId)
+    /// Throws `KiskisError.keychainWriteFailed` if the Keychain write fails.
+    /// The most likely cause in production is errSecInteractionNotAllowed (-25308):
+    /// the device was locked between attestation completing and this write.
+    func saveKeyId(_ keyId: String) throws {
+        let status = KeychainHelper.save(key: keychainKeyIdKey, value: keyId)
+        if status != errSecSuccess {
+            throw KiskisError.keychainWriteFailed(status)
+        }
     }
 
     /// Check if App Attest is supported on this device.
@@ -89,6 +95,17 @@ final class AttestationManager: @unchecked Sendable {
     ///   - keyId: The App Attest key ID.
     /// - Returns: Base64-encoded assertion object.
     func generateAssertion(payload: Data, keyId: String) async throws -> String {
+        // Why: dc- keys are synthetic identifiers created during DeviceCheck fallback —
+        // there is no corresponding App Attest key in the Secure Enclave.
+        // DCAppAttestService.generateAssertion would throw an opaque error; surface the
+        // real cause immediately so callers see a meaningful diagnostic.
+        if keyId.hasPrefix("dc-") {
+            throw KiskisError.attestationFailed(
+                "DeviceCheck keys cannot sign assertions — no App Attest key exists for this device. " +
+                "Use AttestationPolicy.requireAppAttest to refuse weaker devices at init time."
+            )
+        }
+
         guard #available(iOS 14.0, *) else {
             throw KiskisError.attestationUnavailable
         }
@@ -100,7 +117,7 @@ final class AttestationManager: @unchecked Sendable {
         do {
             assertionObject = try await service.generateAssertion(keyId, clientDataHash: clientDataHash)
         } catch {
-            // If assertion fails, it might be a device migration — signal re-attestation needed
+            // Assertion failure on a valid App Attest key typically means device migration
             throw KiskisError.attestationFailed("Assertion failed (device migration?): \(error.localizedDescription)")
         }
 

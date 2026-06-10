@@ -5,6 +5,7 @@ let package = Package(
     name: "Kiskis",
     platforms: [
         .iOS(.v14),
+        .macOS(.v11),     // DCAppAttestService, HKDF, file-protection APIs require 11.0
     ],
     products: [
         .library(

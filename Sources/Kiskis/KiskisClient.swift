@@ -10,27 +10,85 @@ public enum StaleConfigPolicy: Sendable {
     case useSilently
 }
 
+/// File-system protection class for the on-disk config cache.
+///
+/// iOS encrypts cached config files using the class you choose here.
+/// The two relevant levels are:
+///
+/// - `.complete` (default): file is **unreadable while the device is locked**.
+///   Background fetch tasks and locked-state code cannot access the disk cache —
+///   they either perform a full network fetch or find no cache at all.
+///   Choose this when your config contains secrets and you want the strongest
+///   at-rest protection, and you accept that `backgroundRefresh` will always
+///   perform a network round-trip rather than serving a cached value.
+///
+/// - `.untilFirstUserAuthentication`: file is encrypted only until the first
+///   unlock after each boot. After that first unlock it remains readable even
+///   when the device re-locks. Background fetch and locked-state reads hit the
+///   disk cache normally. Choose this when `backgroundRefresh: true` should
+///   actually serve cached values, or when your config contains no plaintext
+///   secrets (e.g. you are using Zero-Knowledge mode).
+public enum CacheFileProtection: Sendable {
+    /// NSFileProtectionComplete — unreadable while locked. Strongest at-rest protection;
+    /// incompatible with background cache reads.
+    case complete
+
+    /// NSFileProtectionCompleteUntilFirstUserAuthentication — readable after first
+    /// boot unlock even when subsequently locked. Required for background refresh
+    /// to benefit from the disk cache.
+    case untilFirstUserAuthentication
+}
+
 /// Configuration for cache behavior.
 public struct CachePolicy: Sendable {
     public var maxStaleness: TimeInterval
+    /// Enable automatic background config refresh.
+    ///
+    /// - Note: If `fileProtection` is `.complete` (the default), background refreshes
+    ///   while the device is locked cannot read the disk cache and will perform a full
+    ///   network fetch instead. Set `fileProtection` to `.untilFirstUserAuthentication`
+    ///   if you need background tasks to serve cached values.
     public var backgroundRefresh: Bool
     public var onStaleConfig: StaleConfigPolicy
+    /// File-system encryption class for the on-disk config cache.
+    /// See `CacheFileProtection` for the trade-off between at-rest security and
+    /// background-readable access.
+    public var fileProtection: CacheFileProtection
 
     public init(
         maxStaleness: TimeInterval = 7 * 24 * 3600,
         backgroundRefresh: Bool = true,
-        onStaleConfig: StaleConfigPolicy = .warnAndUse
+        onStaleConfig: StaleConfigPolicy = .warnAndUse,
+        fileProtection: CacheFileProtection = .complete
     ) {
         self.maxStaleness = maxStaleness
         self.backgroundRefresh = backgroundRefresh
         self.onStaleConfig = onStaleConfig
+        self.fileProtection = fileProtection
     }
 }
 
 /// Zero-knowledge mode configuration.
+///
+/// ZK mode encrypts the config before it leaves your build machine — the Kiskis server stores
+/// and returns only ciphertext. Combined with response signing, secrets' integrity and
+/// confidentiality are independent of TLS.
+///
+/// **What ZK protects:** server-side breach; response interception by a TLS proxy or
+/// custom trust anchor. The server never holds your decryption key.
+///
+/// **What ZK does NOT protect:** static analysis of your app binary. Any `VaultKeyComponent`
+/// value (bundleId, buildNumber, teamId, custom string) is recoverable from the IPA.
+/// An attacker with the binary can reconstruct the key and decrypt. On iOS, no client-side
+/// scheme prevents this — the key must live in the binary. Use ZK for server-side
+/// confidentiality, not binary analysis resistance.
+///
+/// For the strongest on-device key, use `.enabled(key:)` with a randomly generated
+/// high-entropy constant, but understand that binary extraction still ultimately applies.
 public enum ZeroKnowledgeMode: Sendable {
     case disabled
     case enabled(key: String)
+    @available(*, deprecated, message: "All VaultKeyComponent values are recoverable from the app binary via static analysis. Use ZeroKnowledgeMode.enabled(key:) with a high-entropy value instead.")
     case derived(components: [VaultKeyComponent])
 
     var resolvedKey: String? {
@@ -43,6 +101,8 @@ public enum ZeroKnowledgeMode: Sendable {
 }
 
 /// Components for deriving a vault key.
+/// - Warning: All component values are recoverable from the app binary via static analysis.
+///   Used only with the deprecated `ZeroKnowledgeMode.derived` case.
 public enum VaultKeyComponent: Sendable {
     case bundleId
     case buildNumber
@@ -154,6 +214,54 @@ public enum KiskisError: Error, Sendable {
     case blobDownloadFailed(String)
     case blobIntegrityFailed(String)
     case notRegistered
+    /// Keychain write returned a non-success OSStatus. The most common cause is
+    /// errSecInteractionNotAllowed (-25308): the device was locked when a
+    /// WhenUnlockedThisDeviceOnly item was written from a background context.
+    case keychainWriteFailed(OSStatus)
+}
+
+// MARK: - AttestationPolicy
+
+/// Controls which device attestation mechanisms the SDK will accept.
+///
+/// App Attest cryptographically binds the key to the app binary and the Secure Enclave.
+/// DeviceCheck only proves "real Apple device" — it cannot verify app integrity and
+/// its synthetic keyId cannot sign subsequent assertions (so requests fail at runtime).
+///
+/// Use `.requireAppAttest` (the default) for any client that fetches secrets or uses ZK mode.
+/// Use `.allowDeviceCheckFallback` only if you explicitly want to gate real devices
+/// even when App Attest isn't available, and understand that signed requests will not work.
+public enum AttestationPolicy: Sendable {
+    /// Only App Attest is accepted. Throws `attestationUnavailable` on iOS <14 or
+    /// devices without a Secure Enclave rather than falling back to DeviceCheck.
+    /// This is the default and the only safe choice for secret-bearing requests.
+    case requireAppAttest
+
+    /// Allow DeviceCheck as a fallback when App Attest is unavailable.
+    /// Note: DeviceCheck devices cannot sign assertions — any protected request
+    /// will still throw. This mode is useful only for device-gating without serving secrets.
+    case allowDeviceCheckFallback
+}
+
+// MARK: - BlobIntegrityPolicy
+
+/// Controls whether blob downloads are accepted without a SHA-256 hash.
+///
+/// The hash arrives over the authenticated, response-signed config channel. Under
+/// `.requireHash` (the default) the SDK refuses to even fetch a blob whose config
+/// entry omits `sha256` — no bandwidth wasted, no unverified bytes written to disk.
+///
+/// Use `.allowUnverified` only for publicly accessible assets where you deliberately
+/// chose not to include a hash (e.g. a static image that changes frequently and whose
+/// compromise has no security consequence).
+public enum BlobIntegrityPolicy: Sendable {
+    /// Blob downloads are refused unless the BlobReference contains a SHA-256 hash.
+    /// This is the default. Throws `blobIntegrityFailed` before fetching.
+    case requireHash
+
+    /// Allow blob downloads even when no hash is present.
+    /// The download proceeds and no integrity check is performed.
+    case allowUnverified
 }
 
 // MARK: - KiskisClient
@@ -178,6 +286,10 @@ public final class KiskisClient: @unchecked Sendable {
     private let apiURL: URL
     private let cachePolicy: CachePolicy
     private let zeroKnowledge: ZeroKnowledgeMode
+    private let attestationPolicy: AttestationPolicy
+    private let blobIntegrityPolicy: BlobIntegrityPolicy
+    // Why: never read at init time to avoid Bundle I/O in the initializer.
+    // This file is plaintext inside the IPA — secrets must never live here.
     private let fallbackConfigURL: URL?
 
     private let attestationManager: AttestationManager
@@ -197,6 +309,17 @@ public final class KiskisClient: @unchecked Sendable {
         apiURL: URL = URL(string: "https://api.kiskis.dev")!,
         cachePolicy: CachePolicy = CachePolicy(),
         zeroKnowledge: ZeroKnowledgeMode = .disabled,
+        attestationPolicy: AttestationPolicy = .requireAppAttest,
+        blobIntegrityPolicy: BlobIntegrityPolicy = .requireHash,
+        /// URL to a bundled JSON file used when the network is unavailable on first
+        /// launch and no disk cache exists yet.
+        ///
+        /// WARNING: Never put secrets in this file. Bundle resources are plaintext
+        /// inside the IPA — anyone who downloads the app and unpacks the archive can
+        /// read every byte. Use the fallback only for values that are safe to be
+        /// fully public: feature flags, UI copy, non-secret endpoint URLs. API keys,
+        /// tokens, signing secrets, and any value that must stay confidential must
+        /// come from the server. There is no encryption path for bundled resources.
         fallbackConfig: URL? = nil,
         environment: KiskisEnvironment? = nil
     ) {
@@ -206,6 +329,8 @@ public final class KiskisClient: @unchecked Sendable {
         self.apiURL = apiURL
         self.cachePolicy = cachePolicy
         self.zeroKnowledge = zeroKnowledge
+        self.attestationPolicy = attestationPolicy
+        self.blobIntegrityPolicy = blobIntegrityPolicy
         self.fallbackConfigURL = fallbackConfig
 
         // Environment detection priority:
@@ -233,7 +358,12 @@ public final class KiskisClient: @unchecked Sendable {
         // Only the first client created for an app triggers attestation; subsequent
         // clients reuse the keyId stored in the Keychain.
         self.attestationManager = AttestationManager(teamId: self.teamId, bundleId: self.bundleId)
-        self.urlSession = URLSession(configuration: .ephemeral)
+        // Why PinningDelegate: ephemeral configuration avoids credential caching but
+        // does not pin. PinningDelegate adds SPKI hash verification on top of standard
+        // TLS chain validation — rejects connections whose cert chain does not contain
+        // a pinned Cloudflare intermediate, even on devices with custom trust stores.
+        // See PinningDelegate.swift for the openssl command to obtain SPKI hashes.
+        self.urlSession = URLSession(configuration: .ephemeral, delegate: PinningDelegate(), delegateQueue: nil)
 
         // Only set as shared if this is the "default" client (avoids overwriting
         // with a flags-scoped client accidentally).
@@ -244,24 +374,59 @@ public final class KiskisClient: @unchecked Sendable {
 
     // MARK: - App Version
 
+    // Why: version is self-reported from the app bundle — the server receives it as a
+    // client-asserted value. App Attest proves the device and binary are genuine, but
+    // does not cryptographically bind the assertion to a specific version string.
+    // The server uses this to select a config variant; never put secrets in
+    // version-specific variants (see matchVersion in delivery/index.ts for the full
+    // trust model). Use version targeting only for feature flags and non-sensitive defaults.
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
     }
 
     // MARK: - Public API: Config
 
+    /// ZK mode always requires App Attest regardless of the caller-set policy —
+    /// a DeviceCheck device that somehow obtained a vault key could still reconstruct
+    /// it from the binary, so ZK's server-side guarantee depends on the device being
+    /// trustworthy, which only App Attest can assert.
+    private var effectiveAttestationPolicy: AttestationPolicy {
+        if case .disabled = zeroKnowledge { return attestationPolicy }
+        return .requireAppAttest
+    }
+
+    /// Cache-load helper that is ZK-aware.
+    /// Standard mode: delegates directly to ConfigCache.load() (memory then plaintext disk).
+    /// ZK mode: ConfigCache.load() returns the memory cache (it skips the encrypted disk file);
+    /// on cold start (memory empty) we decrypt the disk ciphertext and return the plaintext.
+    private func loadCachedConfig() -> KiskisConfig? {
+        guard let vaultKey = zeroKnowledge.resolvedKey else {
+            return configCache.load()
+        }
+        // Memory cache holds the decrypted KiskisConfig for the session duration.
+        if let memCached = configCache.load() { return memCached }
+        // Cold start: ciphertext is on disk — decrypt on read; plaintext never written to disk.
+        guard let raw = configCache.loadEncryptedRaw(),
+              let decrypted = ZeroKnowledgeCrypto.decrypt(data: raw.data, key: vaultKey, teamId: teamId, bundleId: bundleId),
+              let json = try? JSONSerialization.jsonObject(with: decrypted) as? [String: Any] else {
+            return nil
+        }
+        let age = Date().timeIntervalSince(raw.fetchedAt)
+        return KiskisConfig(data: json, isCached: true, isStale: age > raw.ttl, fetchedAt: raw.fetchedAt)
+    }
+
     /// Return the currently cached config synchronously, without network I/O.
     /// Used by feature flag helpers that need fast, non-async reads.
     /// Returns nil if no config has ever been fetched (first launch offline, no fallback).
     public func currentConfig() -> KiskisConfig? {
-        return configCache.load()
+        return loadCachedConfig()
     }
 
     /// Fetch the app's configuration.
     /// Handles attestation, assertion signing, caching, and background refresh automatically.
     public func fetchConfig() async throws -> KiskisConfig {
         // 1. Try cache first
-        if let cached = configCache.load() {
+        if let cached = loadCachedConfig() {
             if !cached.isStale {
                 if cachePolicy.backgroundRefresh {
                     Task { try? await refreshConfigFromServer() }
@@ -286,7 +451,10 @@ public final class KiskisClient: @unchecked Sendable {
         do {
             return try await refreshConfigFromServer()
         } catch {
-            // 3. First install offline — try fallback
+            // 3. First install offline — serve the bundled fallback.
+            // Why: isStale:true signals that a server fetch is needed when connectivity
+            // returns. The fallback must contain only non-sensitive defaults because it
+            // is plaintext inside the IPA; see the fallbackConfig: init parameter warning.
             if let fallbackURL = fallbackConfigURL,
                let data = try? Data(contentsOf: fallbackURL),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -299,9 +467,25 @@ public final class KiskisClient: @unchecked Sendable {
     // MARK: - Public API: Blob Download
 
     /// Download a binary blob to a file path.
-    /// If `destination` is nil, saves to a temp directory and returns the URL.
-    /// Verifies SHA-256 integrity if the BlobReference includes a hash.
+    /// If `destination` is nil, saves to the caches directory under `kiskis-blobs/`.
+    ///
+    /// Under `.requireHash` (the default `blobIntegrityPolicy`) the download is refused
+    /// before any network request if the BlobReference has no SHA-256 hash. Pass
+    /// `blobIntegrityPolicy: .allowUnverified` at init to opt out for public assets.
+    ///
+    /// Integrity is verified by streaming the downloaded file through SHA256 in 256 KB
+    /// chunks — the file is never loaded fully into memory.
     public func downloadBlob(_ ref: BlobReference, to destination: URL? = nil) async throws -> URL {
+        // Why: refuse before the network request — no bandwidth wasted on a blob we'd
+        // reject anyway. The hash arrives over the authenticated, signed config channel
+        // so its absence is a configuration error, not a runtime surprise.
+        if ref.sha256 == nil && blobIntegrityPolicy == .requireHash {
+            throw KiskisError.blobIntegrityFailed(
+                "Blob \"\(ref.key)\" has no SHA-256 hash in config. " +
+                "Add sha256 to the blob entry, or init with blobIntegrityPolicy: .allowUnverified."
+            )
+        }
+
         // Get presigned URL from Kiskis API
         let presignedURL = try await fetchPresignedBlobURL(blobKey: ref.key)
 
@@ -312,11 +496,21 @@ public final class KiskisClient: @unchecked Sendable {
             throw KiskisError.blobDownloadFailed("Bad response from S3")
         }
 
-        // Verify integrity if SHA-256 is provided
+        // Stream SHA-256 over the downloaded file in 256 KB chunks.
+        // Why: Data(contentsOf:) maps the whole file into memory — a 1 GB ML model
+        // would pin 1 GB of RAM just for the hash check. FileHandle reads are bounded.
         if let expectedHash = ref.sha256 {
-            let fileData = try Data(contentsOf: tempURL)
-            let actualHash = SHA256.hash(data: fileData).map { String(format: "%02x", $0) }.joined()
+            var hasher = SHA256()
+            let handle = try FileHandle(forReadingFrom: tempURL)
+            defer { try? handle.close() }
+            while true {
+                let chunk = handle.readData(ofLength: 256 * 1024)
+                if chunk.isEmpty { break }
+                hasher.update(data: chunk)
+            }
+            let actualHash = hasher.finalize().map { String(format: "%02x", $0) }.joined()
             if actualHash != expectedHash.lowercased() {
+                try? FileManager.default.removeItem(at: tempURL)
                 throw KiskisError.blobIntegrityFailed("SHA-256 mismatch: expected \(expectedHash), got \(actualHash)")
             }
         }
@@ -380,6 +574,15 @@ public final class KiskisClient: @unchecked Sendable {
         if http.statusCode == 404 { return nil }
         guard http.statusCode == 200 else {
             throw KiskisError.serverError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+
+        let sig = http.value(forHTTPHeaderField: "X-Kiskis-Sig")
+        let tsStr = http.value(forHTTPHeaderField: "X-Kiskis-Sig-Ts")
+        guard let sig, let tsStr, let ts = Int(tsStr) else {
+            throw KiskisError.serverError(200, "Missing response signature")
+        }
+        guard verifyResponseSignature(sig: sig, ts: ts, path: request.url?.path ?? "/user/data", body: data) else {
+            throw KiskisError.serverError(200, "Response signature verification failed")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -459,13 +662,14 @@ public final class KiskisClient: @unchecked Sendable {
     /// Build a request with assertion headers.
     /// Every protected request is signed by the Secure Enclave — no tokens.
     /// Build the canonical request string that the server will reconstruct independently.
-    /// Format: "{METHOD}:{path}:{sorted_query}:{body_sha256_or_empty}"
+    /// Format: "{METHOD}:{path}:{sorted_query}:{body_sha256_or_empty}:{teamId}:{ts}"
     /// Must match buildCanonicalClientData() in delivery/index.ts exactly.
     private func canonicalClientData(
         method: String,
         path: String,
         queryItems: [URLQueryItem],
-        body: Data?
+        body: Data?,
+        ts: Int
     ) -> String {
         let sortedQuery = queryItems
             .sorted { $0.name < $1.name }
@@ -477,7 +681,40 @@ public final class KiskisClient: @unchecked Sendable {
         } else {
             bodyHash = ""
         }
-        return "\(method):\(path):\(sortedQuery):\(bodyHash)"
+        // Why: teamId binds the assertion to this tenant; ts bounds replay to a 5-minute
+        // window even if signCount hasn't advanced (e.g. MITM-captured never-sent assertion).
+        // The Secure Enclave signs SHA256 of this string — neither field is spoofable.
+        return "\(method):\(path):\(sortedQuery):\(bodyHash):\(teamId):\(ts)"
+    }
+
+    // Ed25519 public key (raw 32 bytes) for server response signature verification.
+    // Rotate by updating this constant and shipping a new SDK version.
+    // The corresponding private key lives in SSM at /kiskis/prod/response-signing-key.
+    // To regenerate: node -e "const {generateKeyPairSync}=require('crypto');
+    //   const {publicKey}=generateKeyPairSync('ed25519',{publicKeyEncoding:{type:'spki',format:'der'}});
+    //   console.log(publicKey.slice(12).toString('base64'));"
+    private static let responseSigningPublicKey = Data(base64Encoded: "j9y5pLcq8bJa2Zje3TSGMQTlV/SQLxn1dupzCqKOrU0=")!
+
+    /// Verify the Ed25519 signature the server attaches to secret-bearing responses.
+    /// Payload: "${ts}:${path}:${body}" — binds the signature to a specific timestamp,
+    /// endpoint, and exact byte sequence, making it impossible to replay or tamper.
+    private func verifyResponseSignature(sig sigB64url: String, ts: Int, path: String, body: Data) -> Bool {
+        // Reject responses outside a ±5-minute replay window
+        let now = Int(Date().timeIntervalSince1970)
+        guard abs(now - ts) < 300 else { return false }
+
+        // base64url → base64 (replace URL-safe chars, add padding)
+        var b64 = sigB64url
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let rem = b64.count % 4
+        if rem != 0 { b64 += String(repeating: "=", count: 4 - rem) }
+        guard let sigData = Data(base64Encoded: b64) else { return false }
+
+        guard let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: Self.responseSigningPublicKey) else { return false }
+        let bodyStr = String(data: body, encoding: .utf8) ?? ""
+        let payload = Data("\(ts):\(path):\(bodyStr)".utf8)
+        return publicKey.isValidSignature(sigData, for: payload)
     }
 
     private func signedRequest(
@@ -517,11 +754,13 @@ public final class KiskisClient: @unchecked Sendable {
         // Why: build canonical data server-side style so the server can reconstruct
         // it independently from the actual request — never accepted from a header.
         // Format must match buildCanonicalClientData() in delivery/index.ts exactly.
+        let ts = Int(Date().timeIntervalSince1970)
         let signingPayload = canonicalClientData(
             method: method,
             path: components.path,
             queryItems: components.queryItems ?? [],
-            body: body
+            body: body,
+            ts: ts
         )
 
         // Sign with Secure Enclave
@@ -537,6 +776,10 @@ public final class KiskisClient: @unchecked Sendable {
         request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
         request.setValue(environment == .sandbox ? "sandbox" : "production", forHTTPHeaderField: "X-Environment")
         request.setValue(assertionB64, forHTTPHeaderField: "X-Assertion")
+        // Why: ts is sent as a plain header so the server can validate the window before
+        // running the assertion crypto. The assertion itself signs this value — a modified
+        // header would produce a canonical-string mismatch and fail signature verification.
+        request.setValue(String(ts), forHTTPHeaderField: "X-Request-Ts")
 
         // Include push token if available (for registration/updates)
         if let pushToken = pushToken {
@@ -559,6 +802,13 @@ public final class KiskisClient: @unchecked Sendable {
 
         // Already registered?
         if let keyId = attestationManager.storedKeyId {
+            // Why: a device may have stored a dc- key before attestationPolicy was
+            // set to .requireAppAttest (or before ZK was enabled). Clear it and refuse
+            // rather than letting the request reach generateAssertion and fail there.
+            if keyId.hasPrefix("dc-") && effectiveAttestationPolicy == .requireAppAttest {
+                attestationManager.clearKeyId()
+                throw KiskisError.attestationUnavailable
+            }
             return keyId
         }
 
@@ -569,6 +819,13 @@ public final class KiskisClient: @unchecked Sendable {
 
     /// Perform the full App Attest ceremony with the server.
     private func performAttestation() async throws -> (keyId: String, registered: Bool) {
+        // Enforce policy before any network round-trip. If App Attest is required and
+        // this device doesn't support it, fail immediately rather than falling through
+        // to DeviceCheck and storing a dc- keyId that can't sign assertions.
+        if effectiveAttestationPolicy == .requireAppAttest && !attestationManager.isSupported {
+            throw KiskisError.attestationUnavailable
+        }
+
         // 1. Get challenge nonce
         let nonce = try await fetchChallenge()
 
@@ -612,12 +869,26 @@ public final class KiskisClient: @unchecked Sendable {
             } else {
                 environment = .production
             }
-            // Persist so subsequent launches use the correct environment
+            // Persist so subsequent launches use the correct environment.
+            // Why: best-effort — failure here only costs the #if DEBUG environment
+            // fallback on the next cold launch, not correctness or security.
             KeychainHelper.save(key: "kiskis.env.\(teamId).\(bundleId)", value: serverEnv)
         }
 
-        // Save keyId for future assertions
-        attestationManager.saveKeyId(keyId)
+        // Save keyId for future assertions.
+        // Why: catch rather than propagate — the keyId is already registered server-side.
+        // Rethrowing would fail the current request even though attestation succeeded.
+        // The session continues using the in-memory keyId; next launch re-attests, which
+        // risks Apple's key-generation rate limit. Most likely cause of failure: device
+        // locked between attestation completing and this write (errSecInteractionNotAllowed
+        // = -25308 from WhenUnlockedThisDeviceOnly). Log so developers can diagnose.
+        do {
+            try attestationManager.saveKeyId(keyId)
+        } catch KiskisError.keychainWriteFailed(let status) {
+            print("[Kiskis] WARNING: keyId could not be persisted to Keychain (OSStatus \(status)). " +
+                  "Re-attestation will be required next launch — if this recurs, the device may " +
+                  "be hitting Apple's App Attest key-generation rate limit.")
+        }
 
         return (keyId, true)
     }
@@ -650,17 +921,31 @@ public final class KiskisClient: @unchecked Sendable {
             guard let retryHttp = retryResponse as? HTTPURLResponse, retryHttp.statusCode == 200 else {
                 throw KiskisError.attestationFailed("Re-attestation failed")
             }
-            return try processConfigResponse(retryData)
+            return try processConfigResponse(retryData, response: retryHttp)
         }
 
         guard http.statusCode == 200 else {
             throw KiskisError.serverError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
 
-        return try processConfigResponse(data)
+        return try processConfigResponse(data, response: http)
     }
 
-    private func processConfigResponse(_ data: Data) throws -> KiskisConfig {
+    private func processConfigResponse(_ data: Data, response: HTTPURLResponse) throws -> KiskisConfig {
+        // Verify server signature before trusting any content.
+        // Why: makes config integrity independent of TLS — a jailbroken device with a
+        // custom trust anchor or a TLS-inspecting proxy cannot tamper with the config
+        // payload without invalidating the Ed25519 signature over the exact bytes.
+        let sig = response.value(forHTTPHeaderField: "X-Kiskis-Sig")
+        let tsStr = response.value(forHTTPHeaderField: "X-Kiskis-Sig-Ts")
+        guard let sig, let tsStr, let ts = Int(tsStr) else {
+            throw KiskisError.serverError(200, "Missing response signature — ensure SDK and server versions match")
+        }
+        let path = response.url?.path ?? "/config"
+        guard verifyResponseSignature(sig: sig, ts: ts, path: path, body: data) else {
+            throw KiskisError.serverError(200, "Response signature verification failed")
+        }
+
         // Always parse the outer JSON envelope first.
         guard let responseJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw KiskisError.serverError(200, "Invalid JSON")
@@ -679,11 +964,14 @@ public final class KiskisClient: @unchecked Sendable {
             // that bytestream is not the binary ciphertext.
             guard let ciphertextB64 = responseJson["config"] as? String,
                   let ciphertextData = Data(base64Encoded: ciphertextB64),
-                  let decrypted = ZeroKnowledgeCrypto.decrypt(data: ciphertextData, key: vaultKey),
+                  let decrypted = ZeroKnowledgeCrypto.decrypt(data: ciphertextData, key: vaultKey, teamId: teamId, bundleId: bundleId),
                   let decryptedDict = try? JSONSerialization.jsonObject(with: decrypted) as? [String: Any] else {
                 throw KiskisError.zeroKnowledgeDecryptionFailed
             }
             configDict = decryptedDict
+            // Why: ZK — disk holds ciphertext only so plaintext never persists outside
+            // process memory. Decrypt on read via loadCachedConfig() on cold start.
+            configCache.saveEncrypted(ciphertextData: ciphertextData, plaintextData: decrypted)
         } else {
             // Standard mode: config is a JSON object inline in the response.
             if let inner = responseJson["config"] as? [String: Any] {
@@ -691,16 +979,12 @@ public final class KiskisClient: @unchecked Sendable {
             } else {
                 configDict = responseJson
             }
+            if let innerData = try? JSONSerialization.data(withJSONObject: configDict) {
+                configCache.save(data: innerData)
+            }
         }
 
-        let config = KiskisConfig(data: configDict, isCached: false, isStale: false, fetchedAt: Date())
-
-        // Cache the parsed config dict (not the raw response, which for ZK is the encrypted envelope)
-        if let innerData = try? JSONSerialization.data(withJSONObject: configDict) {
-            configCache.save(data: innerData)
-        }
-
-        return config
+        return KiskisConfig(data: configDict, isCached: false, isStale: false, fetchedAt: Date())
     }
 
     // MARK: - Internal: Blob Presigned URL

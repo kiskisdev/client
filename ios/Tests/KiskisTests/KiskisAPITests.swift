@@ -111,12 +111,17 @@ private func kk(
 
 private enum ZKHelper {
 
-    // Must match ZeroKnowledgeCrypto.swift exactly
-    private static let salt = Data("kiskis-zk-salt".utf8)
+    // Must match ZeroKnowledgeCrypto.swift exactly.
+    // Default identity values for unit tests that don't target a specific app.
+    private static let defaultTeamId  = "TEST1234AB"
+    private static let defaultBundleId = "com.test.kiskis"
     private static let info = Data("kiskis-zk-v1".utf8)
 
-    static func deriveKey(_ password: String) -> SymmetricKey {
-        HKDF<SHA256>.deriveKey(
+    static func deriveKey(_ password: String, teamId: String = defaultTeamId, bundleId: String = defaultBundleId) -> SymmetricKey {
+        // Why: salt incorporates teamId/bundleId so different apps with the same vault
+        // password produce different keys. Must match ZeroKnowledgeCrypto.swift salt formula.
+        let salt = Data("kiskis-zk-v2:\(teamId):\(bundleId)".utf8)
+        return HKDF<SHA256>.deriveKey(
             inputKeyMaterial: SymmetricKey(data: Data(password.utf8)),
             salt: salt,
             info: info,
@@ -125,8 +130,8 @@ private enum ZKHelper {
     }
 
     /// Returns: 12-byte nonce || ciphertext || 16-byte GCM tag
-    static func encrypt(_ plaintext: Data, password: String) -> Data? {
-        guard let box = try? AES.GCM.seal(plaintext, using: deriveKey(password)) else { return nil }
+    static func encrypt(_ plaintext: Data, password: String, teamId: String = defaultTeamId, bundleId: String = defaultBundleId) -> Data? {
+        guard let box = try? AES.GCM.seal(plaintext, using: deriveKey(password, teamId: teamId, bundleId: bundleId)) else { return nil }
         var out = Data()
         out.append(contentsOf: box.nonce)
         out.append(box.ciphertext)
@@ -134,7 +139,7 @@ private enum ZKHelper {
         return out
     }
 
-    static func decrypt(_ ciphertext: Data, password: String) -> Data? {
+    static func decrypt(_ ciphertext: Data, password: String, teamId: String = defaultTeamId, bundleId: String = defaultBundleId) -> Data? {
         guard ciphertext.count > 28 else { return nil }
         let nonce = ciphertext.prefix(12)
         let body  = ciphertext.dropFirst(12)
@@ -143,20 +148,20 @@ private enum ZKHelper {
             ciphertext: body.dropLast(16),
             tag: body.suffix(16)
         ) else { return nil }
-        return try? AES.GCM.open(box, using: deriveKey(password))
+        return try? AES.GCM.open(box, using: deriveKey(password, teamId: teamId, bundleId: bundleId))
     }
 
     /// Encrypt a JSON dictionary and base64-encode — exact wire format sent to Kiskis
-    static func encryptJson(_ dict: [String: Any], password: String) -> String? {
+    static func encryptJson(_ dict: [String: Any], password: String, teamId: String = defaultTeamId, bundleId: String = defaultBundleId) -> String? {
         guard let json = try? JSONSerialization.data(withJSONObject: dict),
-              let enc  = encrypt(json, password: password) else { return nil }
+              let enc  = encrypt(json, password: password, teamId: teamId, bundleId: bundleId) else { return nil }
         return enc.base64EncodedString()
     }
 
     /// Decode base64, decrypt, parse JSON — mirrors KiskisClient.processConfigResponse
-    static func decryptJson(_ b64: String, password: String) -> [String: Any]? {
+    static func decryptJson(_ b64: String, password: String, teamId: String = defaultTeamId, bundleId: String = defaultBundleId) -> [String: Any]? {
         guard let data = Data(base64Encoded: b64),
-              let dec  = decrypt(data, password: password),
+              let dec  = decrypt(data, password: password, teamId: teamId, bundleId: bundleId),
               let json = try? JSONSerialization.jsonObject(with: dec) as? [String: Any] else { return nil }
         return json
     }
