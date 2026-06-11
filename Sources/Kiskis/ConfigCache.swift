@@ -16,6 +16,14 @@ import Foundation
 /// with AES-256-GCM before it ever reaches the cache. In ZK mode the disk cache holds
 /// the server ciphertext; plaintext is kept in the in-process memory cache only.
 final class ConfigCache: @unchecked Sendable {
+    /// Freshness window before a cached config is flagged stale and a background
+    /// refresh is triggered. Why 6h (was 1h): the cache is still served up to
+    /// `CachePolicy.maxStaleness` (7 days) regardless, and urgent config changes
+    /// propagate instantly via silent push — so the TTL is only the fallback refresh
+    /// cadence for devices that missed a push. 6h cuts background refresh fetches
+    /// ~6x versus hourly, with negligible freshness impact.
+    static let defaultTTL: TimeInterval = 6 * 3600
+
     private let cacheDir: URL
     private let configFile: URL
     private let metadataFile: URL
@@ -117,7 +125,7 @@ final class ConfigCache: @unchecked Sendable {
     }
 
     /// Save plaintext config data to file cache and memory.
-    func save(data: Data, ttl: TimeInterval = 3600) {
+    func save(data: Data, ttl: TimeInterval = ConfigCache.defaultTTL) {
         // Write config data to file
         try? data.write(to: configFile, options: writeOptions())
 
@@ -144,7 +152,7 @@ final class ConfigCache: @unchecked Sendable {
 
     /// Save ZK-mode config: ciphertext goes to disk, plaintext stays in memory only.
     /// On the cold-start read path, use loadEncryptedRaw() + decrypt rather than load().
-    func saveEncrypted(ciphertextData: Data, plaintextData: Data, ttl: TimeInterval = 3600) {
+    func saveEncrypted(ciphertextData: Data, plaintextData: Data, ttl: TimeInterval = ConfigCache.defaultTTL) {
         // Why: ZK guarantee — disk holds ciphertext only; an attacker with file access
         // cannot read secrets while the device is unlocked without also having the vault key.
         try? ciphertextData.write(to: configFile, options: writeOptions())
@@ -200,7 +208,7 @@ final class ConfigCache: @unchecked Sendable {
     }
 
     private func readTTL() -> TimeInterval {
-        return readMetadata()?.ttl ?? 3600
+        return readMetadata()?.ttl ?? ConfigCache.defaultTTL
     }
 
     private func readMetadata() -> CacheMetadata? {
