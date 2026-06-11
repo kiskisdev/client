@@ -8,10 +8,11 @@ import Security
 /// on every renewal even when the key pair is reused. SPKI pins survive cert rotation
 /// as long as the public key stays the same — typically true for CA intermediates.
 ///
-/// Why pin intermediates, not leaf: Cloudflare rotates leaf certs frequently.
-/// Pinning an intermediate (or the root) survives those rotations without requiring
-/// a forced SDK update. Include both the current intermediate and a backup so key
-/// rotation can be rolled out before the old cert expires.
+/// Why pin the root, not the leaf: Let's Encrypt issues short-lived leaf certs
+/// (~90 days) from a rotating pool of intermediates (E5/E6/E7/E8…). Pinning the
+/// stable ISRG root survives both rotations without requiring a forced SDK update.
+/// A current intermediate is included as a backup pin so the pin set can be
+/// migrated in advance of any future root change.
 ///
 /// Obtaining SPKI hashes for api.kiskis.dev:
 ///   openssl s_client -connect api.kiskis.dev:443 -showcerts 2>/dev/null \
@@ -29,18 +30,22 @@ final class PinningDelegate: NSObject, URLSessionDelegate {
 
     // MARK: - Pinned hashes
 
-    // Why: pin the Cloudflare intermediate CA(s), not the leaf cert (which rotates
-    // every ~90 days) and not the root alone (too broad — accepts any DigiCert-signed cert).
-    // Replace these placeholders with real hashes from the openssl command above before
-    // shipping. Require at least two entries (current + backup) so rotation is non-breaking.
+    // Why these pins: api.kiskis.dev serves a Let's Encrypt ECDSA chain
+    // (leaf P-256 → "Let's Encrypt E7" P-384 intermediate → ISRG Root X2 P-384).
+    // ISRG Root X2 is stable for years and is the primary pin; the current E7
+    // intermediate is the backup so the set can be migrated before any root change.
+    // Both keys are ECDSA, which spkiSHA256(for:) supports. ISRG Root X1 is RSA and
+    // is intentionally NOT pinned — this implementation does not hash RSA keys, and
+    // the kiskis.dev chain is ECDSA-only. Re-derive with the openssl command above
+    // if the CA or chain ever changes.
     static let pinnedSPKIHashes: Set<Data> = {
-        let placeholders: [String] = [
-            // TODO: replace with actual Cloudflare intermediate SPKI SHA-256 (base64)
-            // from running the openssl command above against api.kiskis.dev
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",  // primary intermediate
-            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",  // backup / rotation target
+        let hashes: [String] = [
+            // ISRG Root X2 (ECDSA P-384) — primary, stable for years
+            "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",
+            // Let's Encrypt E7 intermediate (ECDSA P-384) — backup / rotation target
+            "y7xVm0TVJNahMr2sZydE2jQH8SquXV9yLF9seROHHHU=",
         ]
-        return Set(placeholders.compactMap { Data(base64Encoded: $0) })
+        return Set(hashes.compactMap { Data(base64Encoded: $0) })
     }()
 
     // MARK: - URLSessionDelegate

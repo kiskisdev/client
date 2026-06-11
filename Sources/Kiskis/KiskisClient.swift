@@ -264,6 +264,19 @@ public enum BlobIntegrityPolicy: Sendable {
     case allowUnverified
 }
 
+public enum CertificatePinningPolicy: Sendable {
+    /// SPKI pins in `PinningDelegate` are enforced on top of standard TLS
+    /// chain validation. This is the default.
+    case enabled
+
+    /// Disable SPKI pinning (standard TLS chain validation still applies).
+    /// Why: an operational kill switch. If a CA key rotation ever ships before
+    /// the pin set is updated, every install would fail closed with no way to
+    /// recover short of an App Store release. This lets an app disable pinning
+    /// via its own remote config without a resubmission. Leave it `.enabled`.
+    case disabled
+}
+
 // MARK: - KiskisClient
 
 /// Main entry point for the Kiskis SDK.
@@ -311,6 +324,7 @@ public final class KiskisClient: @unchecked Sendable {
         zeroKnowledge: ZeroKnowledgeMode = .disabled,
         attestationPolicy: AttestationPolicy = .requireAppAttest,
         blobIntegrityPolicy: BlobIntegrityPolicy = .requireHash,
+        certificatePinning: CertificatePinningPolicy = .enabled,
         /// URL to a bundled JSON file used when the network is unavailable on first
         /// launch and no disk cache exists yet.
         ///
@@ -361,9 +375,16 @@ public final class KiskisClient: @unchecked Sendable {
         // Why PinningDelegate: ephemeral configuration avoids credential caching but
         // does not pin. PinningDelegate adds SPKI hash verification on top of standard
         // TLS chain validation — rejects connections whose cert chain does not contain
-        // a pinned Cloudflare intermediate, even on devices with custom trust stores.
+        // a pinned Let's Encrypt CA, even on devices with custom trust stores.
         // See PinningDelegate.swift for the openssl command to obtain SPKI hashes.
-        self.urlSession = URLSession(configuration: .ephemeral, delegate: PinningDelegate(), delegateQueue: nil)
+        // Why optional: certificatePinning: .disabled is a kill switch for a CA
+        // rotation emergency — see CertificatePinningPolicy.
+        switch certificatePinning {
+        case .enabled:
+            self.urlSession = URLSession(configuration: .ephemeral, delegate: PinningDelegate(), delegateQueue: nil)
+        case .disabled:
+            self.urlSession = URLSession(configuration: .ephemeral)
+        }
 
         // Only set as shared if this is the "default" client (avoids overwriting
         // with a flags-scoped client accidentally).
