@@ -1080,32 +1080,53 @@ This is rarely needed — the server detection is authoritative and correct for 
 
 | Environment | Secure Enclave | Bypass Secret | App Attest |
 |-------------|----------------|---------------|-----------|
-| Xcode Simulator | No — not supported | Use bypass secret | N/A |
-| Physical device (debug build) | Yes | Optional | Sandbox |
-| Physical device (release build) | Yes | No — compiled out | Production |
-| TestFlight | Yes | No — compiled out | Production |
-| App Store | Yes | No — compiled out | Production |
+| Xcode Simulator | No — not supported | Active when set | N/A (bypass) |
+| Physical device (debug build) | Yes | Compiled out — ignored | Sandbox |
+| Physical device (release build) | Yes | Compiled out — ignored | Production |
+| TestFlight | Yes | Compiled out — ignored | Production |
+| App Store | Yes | Compiled out — ignored | Production |
+
+The bypass is **Simulator-only** (SDK 0.1.2+). It is compiled out of every build that
+runs on real hardware — including debug builds on device — so setting the env var never
+affects a device build.
 
 ### Simulator & CI: The Bypass Secret
 
 iOS Simulator has no Secure Enclave. Apple App Attest requires hardware attestation — it cannot run in the Simulator or on Linux CI runners (GitHub Actions, Bitrise, etc.). Without a solution, `fetchConfig()` throws `attestationUnavailable` in every simulator run.
 
-The **bypass secret** solves this. It is a per-team credential that lets `#if DEBUG` SDK builds skip App Attest and authenticate via a shared secret instead.
+The **bypass secret** solves this — for the Simulator only. It is a per-team credential that lets **Simulator** builds skip App Attest and authenticate via a shared secret instead.
 
-**Security guarantee:** The bypass path is wrapped in `#if DEBUG`, a Swift compile-time flag. It is physically absent from App Store and TestFlight builds. An attacker who obtains the bypass secret cannot use it in production because the code to send it does not exist in the release binary.
+#### The bypass is Simulator-only, not "debug-only"
+
+This is the most important thing to understand, and the most common source of confusion. As of SDK **0.1.2** the bypass code is gated on `#if DEBUG && targetEnvironment(simulator)`. `targetEnvironment(simulator)` is a **compile-time** condition that is true only when the build destination is a Simulator:
+
+- **Simulator build** → the bypass code is present and activates when `KISKIS_BYPASS_SECRET` is set.
+- **Any build that runs on a real device** (debug, release, TestFlight, App Store) → the bypass code is **physically compiled out**. The app always runs real App Attest, even if `KISKIS_BYPASS_SECRET` is set in the environment. A device has a Secure Enclave, so it doesn't need — and can't use — the bypass.
+
+**A debug build on device does NOT use the bypass.** "Debug" is not the trigger; "running in the Simulator" is. This is why a debug build on your phone with the env var set still performs real attestation.
+
+**You can therefore set `KISKIS_BYPASS_SECRET` once and leave it.** Put it in your scheme's environment variables and forget it — it activates in the Simulator and is inert on device. No per-run scheme editing, no separate "device" and "simulator" schemes.
+
+> **Upgrade note:** before 0.1.2 the gate was `#if DEBUG` alone, so a *device* debug build with the env var set would incorrectly send bypass headers instead of a real assertion — and production rejects bypass tokens, producing a `401` / "Re-attestation failed". If you see that, upgrade to 0.1.2+ (and/or clear the env var for device runs).
+
+**Security guarantees (two independent layers):**
+
+1. **Client:** the bypass is gated on `targetEnvironment(simulator)`, so the code to send a bypass token does not exist in any build that runs on real hardware. An attacker who obtains the secret cannot use it from a device build — the code isn't there.
+2. **Server:** the delivery Lambda only honors bypass tokens on non-production stacks (`ALLOW_DEV_TOKENS === 'true' && STACK_ENV !== 'prod'`, and only for `X-Environment: sandbox`). A bypass token can **never** authenticate against production, even if one were somehow sent.
 
 #### How It Works
 
 ```
-Simulator / CI:
+Simulator (build destination = Simulator), with KISKIS_BYPASS_SECRET set:
   SDK reads KISKIS_BYPASS_SECRET from process environment
   → sends X-Bypass-Token: <secret>, X-Team-Id, X-Bundle-Id headers
-  → server looks up SHA-256(secret) in DynamoDB under BYPASS#{teamId}
+  → non-prod server looks up SHA-256(secret) in DynamoDB under BYPASS#{teamId}
   → if match: returns config (authenticated as simulator for this team)
-  → if no match: falls through to assertion verification → 401
+  → if no match, or a prod stack: falls through to assertion verification → 401
 
-Real device (any build configuration):
-  Normal App Attest assertion flow — bypass code does not execute
+Any device build (debug, release, TestFlight, App Store):
+  Bypass code is compiled out. The app always runs the real App Attest
+  assertion flow; KISKIS_BYPASS_SECRET is ignored even if present.
 ```
 
 #### Step 1: Generate a Bypass Secret
@@ -1131,6 +1152,10 @@ Add a new environment variable:
 | `KISKIS_BYPASS_SECRET` | `kk_dev_your_secret_here` |
 
 The SDK reads this variable at runtime. Your Simulator builds will now fetch real config from the server, exactly as a real device would.
+
+**Set it once and leave it.** On 0.1.2+ the variable is inert on device (the bypass code is compiled out), so you do not need to remove it before running on hardware or cutting a release — there's no separate "device" scheme to maintain.
+
+> **Secret hygiene:** a *shared* scheme is committed to git, which would leak the secret. Keep the scheme **unshared** (per-developer, under `xcuserdata/`, gitignored), or store the value in a gitignored `.xcconfig` and reference it — don't commit the raw `kk_dev_...` value.
 
 #### Step 3: Configure GitHub Actions / CI
 
@@ -1167,7 +1192,7 @@ After revoking, generate a new secret and update your Xcode scheme and CI secret
 
 #### What the Bypass Does NOT Do
 
-- It does not affect App Store or TestFlight builds (compiled out by `#if DEBUG`).
+- It does not affect any build that runs on real hardware — the Simulator-only code is compiled out of every device build (debug, release, TestFlight, App Store) by `#if DEBUG && targetEnvironment(simulator)`.
 - It does not bypass rate limiting or billing — requests are counted normally.
 - It does not grant access to other teams' data — the secret is scoped to a specific Apple Team ID.
 - It does not enable Zero-Knowledge decryption — the SDK still needs the vault key you provided for that.
@@ -1195,7 +1220,7 @@ After revoking, generate a new secret and update your Xcode scheme and CI secret
 | Device Migration | Auto re-attest when user restores to new iPhone |
 | Webhook Notifications | Get notified on config changes |
 | Coupon System | Discount codes for billing |
-| Simulator / CI Bypass | `#if DEBUG` bypass secret — skip App Attest in Simulator and CI without changing code |
+| Simulator / CI Bypass | Simulator-only bypass secret (`#if DEBUG && targetEnvironment(simulator)`) — skip App Attest in the Simulator and CI; compiled out of every device build |
 
 ## Pricing
 
