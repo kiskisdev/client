@@ -754,10 +754,13 @@ public final class KiskisClient: @unchecked Sendable {
             request.httpBody = body
         }
 
-        // Why: #if DEBUG is evaluated at compile time. The bypass block is physically
-        // absent from App Store / TestFlight builds — it cannot be triggered in
-        // production even if an attacker obtains the bypass secret.
-        #if DEBUG
+        // Why: gated on `targetEnvironment(simulator)`, not just DEBUG. App Attest cannot
+        // run in the Simulator (no Secure Enclave), which is the only reason the bypass
+        // exists. On a real device — DEBUG or not — this block is physically compiled out,
+        // so a device build always uses real attestation even if KISKIS_BYPASS_SECRET is
+        // set. Lets developers leave the env var in the scheme permanently: inert on device,
+        // active only in the Simulator. Also means the bypass can never fire against prod.
+        #if DEBUG && targetEnvironment(simulator)
         if let bypassSecret = ProcessInfo.processInfo.environment["KISKIS_BYPASS_SECRET"] {
             // Bypass path: send the secret instead of an App Attest assertion.
             // The server verifies the secret against a SHA-256 hash in DynamoDB and,
@@ -813,7 +816,9 @@ public final class KiskisClient: @unchecked Sendable {
     /// Ensure the device is registered (attested). Returns the keyId.
     /// First launch: performs attestation. Subsequent: returns stored keyId.
     private func ensureRegistered() async throws -> String {
-        #if DEBUG
+        // Simulator-only (see signedRequest): a device build compiles this out and always
+        // attests for real, so the bypass env var is inert on device.
+        #if DEBUG && targetEnvironment(simulator)
         // Bypass mode: no Secure Enclave needed. Return a dummy keyId; the server
         // identifies the request by the X-Bypass-Token header instead.
         if ProcessInfo.processInfo.environment["KISKIS_BYPASS_SECRET"] != nil {
