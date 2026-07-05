@@ -714,7 +714,7 @@ public final class KiskisClient: @unchecked Sendable {
     // To regenerate: node -e "const {generateKeyPairSync}=require('crypto');
     //   const {publicKey}=generateKeyPairSync('ed25519',{publicKeyEncoding:{type:'spki',format:'der'}});
     //   console.log(publicKey.slice(12).toString('base64'));"
-    private static let responseSigningPublicKey = Data(base64Encoded: "j9y5pLcq8bJa2Zje3TSGMQTlV/SQLxn1dupzCqKOrU0=")!
+    private static let responseSigningPublicKey = Data(base64Encoded: "LNhWnM1urrQcPFe4Xu/woTDu8O3sAmhtq4vEl+a6da8=")!
 
     /// Verify the Ed25519 signature the server attaches to secret-bearing responses.
     /// Payload: "${ts}:${path}:${body}" — binds the signature to a specific timestamp,
