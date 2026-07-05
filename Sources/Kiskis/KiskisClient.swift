@@ -685,11 +685,18 @@ public final class KiskisClient: @unchecked Sendable {
     /// Build the canonical request string that the server will reconstruct independently.
     /// Format: "{METHOD}:{path}:{sorted_query}:{body_sha256_or_empty}:{teamId}:{ts}"
     /// Must match buildCanonicalClientData() in delivery/index.ts exactly.
-    private func canonicalClientData(
+    ///
+    /// - Note: `static` and `internal` (not `private`) so the contract test can pin the exact
+    ///   output. This string is what the Secure Enclave signs; if it drifts from the server's
+    ///   buildCanonicalClientData, every assertion fails verification (this happened — SDK 0.1.0
+    ///   omitted teamId + ts). See CanonicalContractTests, whose golden vectors are shared with
+    ///   the server's canonical-contract.test.ts.
+    static func canonicalClientData(
         method: String,
         path: String,
         queryItems: [URLQueryItem],
         body: Data?,
+        teamId: String,
         ts: Int
     ) -> String {
         let sortedQuery = queryItems
@@ -779,11 +786,12 @@ public final class KiskisClient: @unchecked Sendable {
         // it independently from the actual request — never accepted from a header.
         // Format must match buildCanonicalClientData() in delivery/index.ts exactly.
         let ts = Int(Date().timeIntervalSince1970)
-        let signingPayload = canonicalClientData(
+        let signingPayload = Self.canonicalClientData(
             method: method,
             path: components.path,
             queryItems: components.queryItems ?? [],
             body: body,
+            teamId: teamId,
             ts: ts
         )
 
