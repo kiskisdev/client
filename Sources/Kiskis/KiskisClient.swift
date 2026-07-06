@@ -661,31 +661,24 @@ public final class KiskisClient: @unchecked Sendable {
     /// Save per-user data. `userId` is any identifier from your system.
     public func saveUserData(userId: String, data: [String: Any]) async throws {
         let jsonData = try JSONSerialization.data(withJSONObject: data)
-        var request = try await signedRequest(
+        let (_, http) = try await executeSignedRequest(
             path: "user/data",
             queryItems: [URLQueryItem(name: "user_id", value: userId)],
             method: "PUT",
-            body: jsonData
+            body: jsonData,
+            contentType: "application/json"
         )
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let (_, response) = try await urlSession.kiskisData(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        guard http.statusCode == 200 else {
             throw KiskisError.networkError("Failed to save user data")
         }
     }
 
     /// Load per-user data. Returns nil if no data exists for this user.
     public func loadUserData(userId: String) async throws -> [String: Any]? {
-        let request = try await signedRequest(
+        let (data, http) = try await executeSignedRequest(
             path: "user/data",
             queryItems: [URLQueryItem(name: "user_id", value: userId)]
         )
-
-        let (data, response) = try await urlSession.kiskisData(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw KiskisError.networkError("Invalid response")
-        }
 
         if http.statusCode == 404 { return nil }
         guard http.statusCode == 200 else {
@@ -697,7 +690,7 @@ public final class KiskisClient: @unchecked Sendable {
         guard let sig, let tsStr, let ts = Int(tsStr) else {
             throw KiskisError.serverError(200, "Missing response signature")
         }
-        guard verifyResponseSignature(sig: sig, ts: ts, path: request.url?.path ?? "/user/data", body: data) else {
+        guard verifyResponseSignature(sig: sig, ts: ts, path: "/user/data", body: data) else {
             throw KiskisError.serverError(200, "Response signature verification failed")
         }
 
@@ -730,9 +723,8 @@ public final class KiskisClient: @unchecked Sendable {
     /// For stronger anti-abuse, pair with StoreKit Introductory Offer limits (tied to
     /// Apple ID) or your own user identity.
     public func deviceInfo() async throws -> DeviceInfo {
-        let request = try await signedRequest(path: "device/info")
-        let (data, response) = try await urlSession.kiskisData(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        let (data, http) = try await executeSignedRequest(path: "device/info")
+        guard http.statusCode == 200 else {
             throw KiskisError.networkError("Failed to fetch device info")
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -764,11 +756,8 @@ public final class KiskisClient: @unchecked Sendable {
     /// device, send a push to the userId so all other devices refresh immediately.
     public func setUserId(_ userId: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["user_id": userId])
-        var request = try await signedRequest(path: "push/register", method: "POST", body: body)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let (_, response) = try await urlSession.kiskisData(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        let (_, http) = try await executeSignedRequest(path: "push/register", method: "POST", body: body, contentType: "application/json")
+        guard http.statusCode == 200 else {
             throw KiskisError.networkError("Failed to register userId for push")
         }
     }
@@ -844,7 +833,8 @@ public final class KiskisClient: @unchecked Sendable {
         path: String,
         queryItems: [URLQueryItem] = [],
         method: String = "GET",
-        body: Data? = nil
+        body: Data? = nil,
+        contentType: String? = nil
     ) async throws -> URLRequest {
         var components = URLComponents(url: apiURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         if !queryItems.isEmpty {
@@ -854,6 +844,9 @@ public final class KiskisClient: @unchecked Sendable {
         request.httpMethod = method
         if let body = body {
             request.httpBody = body
+        }
+        if let contentType {
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
 
         // Why: gated on `targetEnvironment(simulator)`, not just DEBUG. App Attest cannot
@@ -925,6 +918,28 @@ public final class KiskisClient: @unchecked Sendable {
         }
 
         return request
+    }
+
+    /// Build AND send a signed request, serialized per app so concurrent requests don't race
+    /// the shared App Attest key's monotonic signCount (the server rejects out-of-order counts
+    /// as replays). The whole round-trip is serialized — build assertion → send → await — so
+    /// each request is fully processed before the next assertion is generated.
+    private func executeSignedRequest(
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        method: String = "GET",
+        body: Data? = nil,
+        contentType: String? = nil
+    ) async throws -> (Data, HTTPURLResponse) {
+        let serializer = RequestSerializer.forApp("\(teamId).\(bundleId)")
+        return try await serializer.run { [self] in
+            let request = try await signedRequest(path: path, queryItems: queryItems, method: method, body: body, contentType: contentType)
+            let (data, response) = try await urlSession.kiskisData(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw KiskisError.networkError("Invalid response")
+            }
+            return (data, http)
+        }
     }
 
     /// Ensure the device is registered (attested). Returns the keyId.
@@ -1074,23 +1089,15 @@ public final class KiskisClient: @unchecked Sendable {
         // and we re-attest, this is the "stale" keyId to replace — not the live stored value,
         // which a sibling client may have already replaced (that late read spawned duplicates).
         let signingKeyId = attestationManager.storedKeyId
-        var request = try await signedRequest(path: "config", queryItems: queryItems)
-
-        let (data, response) = try await urlSession.kiskisData(for: request)
-
-        guard let http = response as? HTTPURLResponse else {
-            throw KiskisError.networkError("Invalid response")
-        }
+        let (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
 
         if http.statusCode == 401 || http.statusCode == 403 {
             KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
             // Assertion rejected server-side — re-attest (coordinated) and retry once.
             let _ = try await attestCoordinated(replacingStaleKey: signingKeyId)
-            // Retry with fresh assertion
-            request = try await signedRequest(path: "config", queryItems: queryItems)
-            let (retryData, retryResponse) = try await urlSession.kiskisData(for: request)
-            guard let retryHttp = retryResponse as? HTTPURLResponse, retryHttp.statusCode == 200 else {
-                KiskisLog.error(.config, "retry after re-attestation still failed (\((retryResponse as? HTTPURLResponse)?.statusCode ?? -1))")
+            let (retryData, retryHttp) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+            guard retryHttp.statusCode == 200 else {
+                KiskisLog.error(.config, "retry after re-attestation still failed (\(retryHttp.statusCode))")
                 throw KiskisError.attestationFailed("Re-attestation failed")
             }
             KiskisLog.info(.config, "GET /config → 200 after re-attestation")
@@ -1165,11 +1172,9 @@ public final class KiskisClient: @unchecked Sendable {
     // MARK: - Internal: Blob Presigned URL
 
     private func fetchPresignedBlobURL(blobKey: String) async throws -> URL {
-        let request = try await signedRequest(path: "blob/\(blobKey)")
+        let (data, http) = try await executeSignedRequest(path: "blob/\(blobKey)")
 
-        let (data, response) = try await urlSession.kiskisData(for: request)
-
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        guard http.statusCode == 200 else {
             throw KiskisError.blobDownloadFailed("Failed to get presigned URL")
         }
 
