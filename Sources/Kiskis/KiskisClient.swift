@@ -13,6 +13,19 @@ public enum StaleConfigPolicy: Sendable {
     case useSilently
 }
 
+/// How `fetchConfig` balances latency against freshness.
+///
+/// - `cacheFirst`: return the cached config immediately and revalidate in the background.
+///   The fresh doc lands in the cache for the NEXT fetch. Right for launch paths.
+/// - `freshFirst`: await the server round-trip and return the fresh config; fall back to
+///   the cache only if the network fails. Right for push-triggered refreshes — a refresh
+///   push means "the config changed, come get it", and answering it from cache serves
+///   exactly the doc the push invalidated.
+public enum FetchFreshness: Sendable {
+    case cacheFirst
+    case freshFirst
+}
+
 /// File-system protection class for the on-disk config cache.
 ///
 /// iOS encrypts cached config files using the class you choose here.
@@ -544,7 +557,30 @@ public final class KiskisClient: @unchecked Sendable {
 
     /// Fetch the app's configuration.
     /// Handles attestation, assertion signing, caching, and background refresh automatically.
-    public func fetchConfig() async throws -> KiskisConfig {
+    ///
+    /// - Parameter freshness: `.cacheFirst` (default) returns the cached config instantly and
+    ///   revalidates in the background — right for launch paths where UI latency matters.
+    ///   `.freshFirst` awaits the server and returns the fresh config, using the cache only if
+    ///   the network fails — use this in push-triggered refresh paths, where returning the
+    ///   cache would answer the very push that announced the change with the doc it invalidated
+    ///   (the "one refresh cycle late" bug).
+    public func fetchConfig(freshness: FetchFreshness = .cacheFirst) async throws -> KiskisConfig {
+        if freshness == .freshFirst {
+            do {
+                return try await refreshConfigFromServer()
+            } catch {
+                // Degrade, never regress: a failed fresh fetch should behave no worse than
+                // cacheFirst would have. Any cached doc (stale or not) beats an error here —
+                // the caller asked for "newest available", not "fresh or nothing".
+                if let cached = loadCachedConfig() {
+                    KiskisLog.error(.config, "freshFirst fetch failed — serving cache: \(error)")
+                    return cached
+                }
+                if let fallback = loadFallbackConfig() { return fallback }
+                throw error
+            }
+        }
+
         // 1. Try cache first
         if let cached = loadCachedConfig() {
             if !cached.isStale {
@@ -571,17 +607,22 @@ public final class KiskisClient: @unchecked Sendable {
         do {
             return try await refreshConfigFromServer()
         } catch {
-            // 3. First install offline — serve the bundled fallback.
-            // Why: isStale:true signals that a server fetch is needed when connectivity
-            // returns. The fallback must contain only non-sensitive defaults because it
-            // is plaintext inside the IPA; see the fallbackConfig: init parameter warning.
-            if let fallbackURL = fallbackConfigURL,
-               let data = try? Data(contentsOf: fallbackURL),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                return KiskisConfig(data: json, isCached: false, isStale: true, fetchedAt: .distantPast)
-            }
+            if let fallback = loadFallbackConfig() { return fallback }
             throw error
         }
+    }
+
+    /// First install offline — serve the bundled fallback, if the app ships one.
+    /// Why: isStale:true signals that a server fetch is needed when connectivity
+    /// returns. The fallback must contain only non-sensitive defaults because it
+    /// is plaintext inside the IPA; see the fallbackConfig: init parameter warning.
+    private func loadFallbackConfig() -> KiskisConfig? {
+        guard let fallbackURL = fallbackConfigURL,
+              let data = try? Data(contentsOf: fallbackURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return KiskisConfig(data: json, isCached: false, isStale: true, fetchedAt: .distantPast)
     }
 
     // MARK: - Public API: Blob Download
