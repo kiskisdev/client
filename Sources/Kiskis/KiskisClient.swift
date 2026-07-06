@@ -1095,19 +1095,39 @@ public final class KiskisClient: @unchecked Sendable {
         let signingKeyId = attestationManager.storedKeyId
         var (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
 
-        if http.statusCode == 401 || http.statusCode == 403 {
-            KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
-            // Assertion rejected server-side — re-attest (coordinated) and retry once.
-            let _ = try await attestCoordinated(replacingStaleKey: signingKeyId)
-            (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
-            // Why: only a repeated auth rejection means re-attestation failed. Any OTHER status
-            // (e.g. 404 "no config for this key") is a legitimate response — fall through and
-            // handle it normally instead of mislabeling it "Re-attestation failed".
-            if http.statusCode == 401 || http.statusCode == 403 {
-                KiskisLog.error(.config, "still \(http.statusCode) after re-attestation")
-                throw KiskisError.attestationFailed("Re-attestation failed")
+        // Recover from a server 401/403 WITHOUT minting a new device on a transient rejection.
+        // See ConfigAuthRecovery: the local key is valid (a stale key throws before the HTTP
+        // call), so a 403 here almost always means the server hasn't seen the registration yet
+        // (read-after-write) or a signCount arrived out of order. Retry the SAME key first — a
+        // fresh assertion clears both — and re-attest only as a last resort.
+        let maxSameKeyRetries = 2
+        var retriesDone = 0
+        recovery: while http.statusCode == 401 || http.statusCode == 403 {
+            switch Self.configAuthRecovery(retriesDone: retriesDone, maxSameKeyRetries: maxSameKeyRetries) {
+            case .retrySameKey:
+                KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — retry \(retriesDone + 1)/\(maxSameKeyRetries) with same key")
+                // Escalating backoff (400ms, 800ms) to let an eventually-consistent read catch up.
+                try? await Task.sleep(nanoseconds: UInt64(retriesDone + 1) * 400_000_000)
+                (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+                retriesDone += 1
+            case .reattest:
+                // Same key still rejected after retries — treat as genuinely unregistered
+                // (device revoked server-side) and re-attest once, as a last resort.
+                KiskisLog.error(.config, "GET /config → \(http.statusCode) after \(maxSameKeyRetries) same-key retries — re-attesting (last resort)")
+                let _ = try await attestCoordinated(replacingStaleKey: signingKeyId)
+                (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+                // Why: only a repeated auth rejection means re-attestation failed. Any OTHER
+                // status (e.g. 404 "no config for this key") is legitimate — fall through and
+                // handle it normally instead of mislabeling it "Re-attestation failed".
+                if http.statusCode == 401 || http.statusCode == 403 {
+                    KiskisLog.error(.config, "still \(http.statusCode) after re-attestation")
+                    throw KiskisError.attestationFailed("Re-attestation failed after retries")
+                }
+                break recovery
             }
-            KiskisLog.info(.config, "GET /config → \(http.statusCode) after re-attestation")
+        }
+        if retriesDone > 0 {
+            KiskisLog.info(.config, "GET /config → \(http.statusCode) after recovery")
         }
 
         guard http.statusCode == 200 else {
