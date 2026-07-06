@@ -1089,19 +1089,21 @@ public final class KiskisClient: @unchecked Sendable {
         // and we re-attest, this is the "stale" keyId to replace — not the live stored value,
         // which a sibling client may have already replaced (that late read spawned duplicates).
         let signingKeyId = attestationManager.storedKeyId
-        let (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+        var (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
 
         if http.statusCode == 401 || http.statusCode == 403 {
             KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
             // Assertion rejected server-side — re-attest (coordinated) and retry once.
             let _ = try await attestCoordinated(replacingStaleKey: signingKeyId)
-            let (retryData, retryHttp) = try await executeSignedRequest(path: "config", queryItems: queryItems)
-            guard retryHttp.statusCode == 200 else {
-                KiskisLog.error(.config, "retry after re-attestation still failed (\(retryHttp.statusCode))")
+            (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+            // Why: only a repeated auth rejection means re-attestation failed. Any OTHER status
+            // (e.g. 404 "no config for this key") is a legitimate response — fall through and
+            // handle it normally instead of mislabeling it "Re-attestation failed".
+            if http.statusCode == 401 || http.statusCode == 403 {
+                KiskisLog.error(.config, "still \(http.statusCode) after re-attestation")
                 throw KiskisError.attestationFailed("Re-attestation failed")
             }
-            KiskisLog.info(.config, "GET /config → 200 after re-attestation")
-            return try processConfigResponse(retryData, response: retryHttp)
+            KiskisLog.info(.config, "GET /config → \(http.statusCode) after re-attestation")
         }
 
         guard http.statusCode == 200 else {
