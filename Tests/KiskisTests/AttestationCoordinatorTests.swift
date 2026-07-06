@@ -35,6 +35,23 @@ final class AttestationCoordinatorTests: XCTestCase {
         XCTAssertEqual(ran, 1, "the attestation op runs exactly once for concurrent callers")
     }
 
+    // The reuse decision that caused the second device: a sibling client re-attests, and a
+    // slightly-later client must REUSE that fresh key rather than re-attesting again — but
+    // only if it's replacing the OLD failed key, not the fresh one.
+    func testShouldReuseStoredKey() {
+        // No stored key → must attest.
+        XCTAssertFalse(KiskisClient.shouldReuseStoredKey(nil, replacing: nil))
+        XCTAssertFalse(KiskisClient.shouldReuseStoredKey(nil, replacing: "X"))
+        // A sibling minted a fresh key (Y) different from the stale one (X) → reuse it.
+        XCTAssertTrue(KiskisClient.shouldReuseStoredKey("Y", replacing: "X"))
+        // First launch: a sibling minted Y while we had nothing → reuse it.
+        XCTAssertTrue(KiskisClient.shouldReuseStoredKey("Y", replacing: nil))
+        // Stored IS the stale key we're replacing → must re-attest (the bug was reusing here).
+        XCTAssertFalse(KiskisClient.shouldReuseStoredKey("X", replacing: "X"))
+        // Never reuse a DeviceCheck fallback key.
+        XCTAssertFalse(KiskisClient.shouldReuseStoredKey("dc-abc", replacing: "X"))
+    }
+
     func testSequentialCallersReattest() async throws {
         // Once an attestation completes, a later (non-overlapping) call attests again — the
         // caller decides via the fast path whether a fresh attestation is actually needed.

@@ -963,13 +963,25 @@ public final class KiskisClient: @unchecked Sendable {
     private func attestCoordinated(replacingStaleKey staleKeyId: String?) async throws -> String {
         let appKey = "\(teamId).\(bundleId)"
         return try await AttestationCoordinator.forApp(appKey).attest { [self] in
-            if let stored = attestationManager.storedKeyId, !stored.hasPrefix("dc-"), stored != staleKeyId {
-                KiskisLog.info(.attestation, "reusing keyId from a concurrent attestation: \(kiskisShortKey(stored))")
+            let stored = attestationManager.storedKeyId
+            if Self.shouldReuseStoredKey(stored, replacing: staleKeyId), let stored {
+                KiskisLog.info(.attestation, "reusing keyId a sibling just attested: \(kiskisShortKey(stored))")
                 return stored
             }
             let (keyId, _) = try await performAttestation()
             return keyId
         }
+    }
+
+    /// Whether the stored keyId can be reused instead of attesting again. It must exist, be a
+    /// real App Attest key (not a `dc-` fallback), and be DIFFERENT from the keyId we're
+    /// replacing (the one that just failed). Reusing the stale key would loop; NOT reusing a
+    /// fresh key a sibling client just minted is what created duplicate device records — so
+    /// `staleKeyId` must be the keyId the failed request actually used, captured up front,
+    /// not the current stored value (which a sibling may have already replaced).
+    static func shouldReuseStoredKey(_ stored: String?, replacing staleKeyId: String?) -> Bool {
+        guard let stored, !stored.hasPrefix("dc-") else { return false }
+        return stored != staleKeyId
     }
 
     /// Perform the full App Attest ceremony with the server.
@@ -1058,6 +1070,10 @@ public final class KiskisClient: @unchecked Sendable {
         ]
 
         KiskisLog.info(.config, "GET /config key=\(configKey) version=\(appVersion)")
+        // Capture the keyId this request signs with, BEFORE sending. If the server rejects it
+        // and we re-attest, this is the "stale" keyId to replace — not the live stored value,
+        // which a sibling client may have already replaced (that late read spawned duplicates).
+        let signingKeyId = attestationManager.storedKeyId
         var request = try await signedRequest(path: "config", queryItems: queryItems)
 
         let (data, response) = try await urlSession.kiskisData(for: request)
@@ -1069,7 +1085,7 @@ public final class KiskisClient: @unchecked Sendable {
         if http.statusCode == 401 || http.statusCode == 403 {
             KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
             // Assertion rejected server-side — re-attest (coordinated) and retry once.
-            let _ = try await attestCoordinated(replacingStaleKey: attestationManager.storedKeyId)
+            let _ = try await attestCoordinated(replacingStaleKey: signingKeyId)
             // Retry with fresh assertion
             request = try await signedRequest(path: "config", queryItems: queryItems)
             let (retryData, retryResponse) = try await urlSession.kiskisData(for: request)
