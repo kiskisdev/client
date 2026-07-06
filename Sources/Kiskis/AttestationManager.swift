@@ -61,12 +61,15 @@ final class AttestationManager: @unchecked Sendable {
         }
 
         // 1. Generate a new key pair in the Secure Enclave
+        KiskisLog.info(.attestation, "attesting: generating Secure Enclave key")
         let keyId: String
         do {
             keyId = try await service.generateKey()
         } catch {
+            KiskisLog.error(.attestation, "generateKey failed: \(error.localizedDescription)")
             throw KiskisError.attestationFailed("Key generation failed: \(error.localizedDescription)")
         }
+        KiskisLog.info(.attestation, "generated keyId=\(kiskisShortKey(keyId)); attesting with Apple")
 
         // 2. Create the client data hash from the challenge
         let challengeData = Data(challenge.utf8)
@@ -117,11 +120,24 @@ final class AttestationManager: @unchecked Sendable {
         do {
             assertionObject = try await service.generateAssertion(keyId, clientDataHash: clientDataHash)
         } catch {
-            // Assertion failure on a valid App Attest key typically means device migration
-            throw KiskisError.attestationFailed("Assertion failed (device migration?): \(error.localizedDescription)")
+            // A stale key (app deleted + reinstalled: the Secure Enclave key is gone but the
+            // keyId persisted in the Keychain) throws DCError.invalidKey. Signal that distinctly
+            // so signedRequest can clear the dead keyId and re-attest instead of hard-failing.
+            if Self.isStaleAppAttestKeyError(error) {
+                throw KiskisError.assertionKeyInvalid
+            }
+            throw KiskisError.attestationFailed("Assertion failed: \(error.localizedDescription)")
         }
 
         return assertionObject.base64EncodedString()
+    }
+
+    /// True if the error is DCError.invalidKey (`com.apple.devicecheck.error` code 2) — the
+    /// stored keyId has no Secure Enclave key. Matched by domain+code so it also holds for the
+    /// bridged NSError form (and stays testable without a real Secure Enclave).
+    static func isStaleAppAttestKeyError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == "com.apple.devicecheck.error" && ns.code == 2 // DCError.Code.invalidKey
     }
 
     /// Delete the stored key ID (for re-attestation after device migration).

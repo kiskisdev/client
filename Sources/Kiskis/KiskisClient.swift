@@ -217,6 +217,9 @@ public enum KiskisError: Error, Sendable {
     case blobDownloadFailed(String)
     case blobIntegrityFailed(String)
     case notRegistered
+    /// The stored App Attest keyId no longer has a Secure Enclave key (e.g. the app was
+    /// deleted and reinstalled). The SDK recovers by re-attesting; surfaced only if that fails.
+    case assertionKeyInvalid
     /// Keychain write returned a non-success OSStatus. The most common cause is
     /// errSecInteractionNotAllowed (-25308): the device was locked when a
     /// WhenUnlockedThisDeviceOnly item was written from a background context.
@@ -292,6 +295,13 @@ public enum CertificatePinningPolicy: Sendable {
 /// ```
 public final class KiskisClient: @unchecked Sendable {
     public static var shared: KiskisClient?
+
+    /// Enable/disable SDK diagnostic logging (unified log, subsystem "dev.kiskis" — visible in
+    /// Xcode's console and Console.app). Default `true`; set `false` in production to silence.
+    public static var loggingEnabled: Bool {
+        get { KiskisLog.enabled }
+        set { KiskisLog.enabled = newValue }
+    }
 
     private let teamId: String
     private let bundleId: String
@@ -404,12 +414,15 @@ public final class KiskisClient: @unchecked Sendable {
             KiskisClient.shared = self
         }
 
+        KiskisLog.info(.config, "init team=\(self.teamId) bundle=\(self.bundleId) key=\(self.configKey) env=\(self.environment == .sandbox ? "sandbox" : "production") attestation=\(self.attestationPolicy == .requireAppAttest ? "requireAppAttest" : "allowDeviceCheck") autoRegisterPush=\(self.autoRegisterPush)")
+
         // Why: the app used to have to call registerForRemoteNotifications() itself, and
         // forgetting it meant no device ever got a push token. Trigger it here so "it gets
         // called" automatically. The token still arrives in the app delegate — forward it
         // with setPushToken(_:). Registration is a no-op/failure (harmless) without the
         // Push Notifications + Background Modes capabilities.
         if self.autoRegisterPush {
+            KiskisLog.info(.push, "autoRegisterPush on — calling registerForRemoteNotifications()")
             Self.triggerRemoteNotificationRegistration()
         }
     }
@@ -439,6 +452,7 @@ public final class KiskisClient: @unchecked Sendable {
     /// The SDK hex-encodes it and sends it to the server on the next signed request.
     public func setPushToken(_ deviceToken: Data) {
         pushToken = Self.hexString(from: deviceToken)
+        KiskisLog.info(.push, "setPushToken received (\(deviceToken.count) bytes) — sent on next signed request")
     }
 
     /// Lowercase hex encoding of raw token bytes (matches what the server stores).
@@ -833,26 +847,37 @@ public final class KiskisClient: @unchecked Sendable {
         #endif
 
         // Production path: full App Attest assertion
-        let keyId = try await ensureRegistered()
+        var keyId = try await ensureRegistered()
 
         // Why: build canonical data server-side style so the server can reconstruct
         // it independently from the actual request — never accepted from a header.
         // Format must match buildCanonicalClientData() in delivery/index.ts exactly.
         let ts = Int(Date().timeIntervalSince1970)
-        let signingPayload = Self.canonicalClientData(
+        let payload = Data(Self.canonicalClientData(
             method: method,
             path: components.path,
             queryItems: components.queryItems ?? [],
             body: body,
             teamId: teamId,
             ts: ts
-        )
+        ).utf8)
 
-        // Sign with Secure Enclave
-        let assertionB64 = try await attestationManager.generateAssertion(
-            payload: Data(signingPayload.utf8),
-            keyId: keyId
-        )
+        // Sign with the Secure Enclave. If the stored App Attest key is stale — deleting and
+        // reinstalling the app wipes the Secure Enclave key but the keyId persists in the
+        // Keychain — generateAssertion throws .assertionKeyInvalid. Clear the dead keyId,
+        // re-attest to mint a fresh one, and retry the signature once.
+        let assertionB64: String
+        do {
+            assertionB64 = try await attestationManager.generateAssertion(payload: payload, keyId: keyId)
+            KiskisLog.info(.attestation, "signed \(method) \(components.path) keyId=\(kiskisShortKey(keyId))")
+        } catch KiskisError.assertionKeyInvalid {
+            KiskisLog.error(.attestation, "stale App Attest key (keyId=\(kiskisShortKey(keyId))) — app likely reinstalled; clearing keyId and re-attesting")
+            attestationManager.clearKeyId()
+            let (freshKeyId, _) = try await performAttestation()
+            keyId = freshKeyId
+            assertionB64 = try await attestationManager.generateAssertion(payload: payload, keyId: keyId)
+            KiskisLog.info(.attestation, "recovered: re-attested keyId=\(kiskisShortKey(keyId)), signed \(method) \(components.path)")
+        }
 
         // Set assertion headers — X-Client-Data is intentionally omitted;
         // the server reconstructs canonical data from the request itself.
@@ -945,8 +970,10 @@ public final class KiskisClient: @unchecked Sendable {
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let errorBody = String(data: data, encoding: .utf8) ?? "Unknown error"
+            KiskisLog.error(.attestation, "POST /auth/attest → \((response as? HTTPURLResponse)?.statusCode ?? -1): \(errorBody)")
             throw KiskisError.attestationFailed(errorBody)
         }
+        KiskisLog.info(.attestation, "registered device keyId=\(kiskisShortKey(keyId))")
 
         // Server detects environment from Apple's AAGUID field — authoritative
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -972,9 +999,7 @@ public final class KiskisClient: @unchecked Sendable {
         do {
             try attestationManager.saveKeyId(keyId)
         } catch KiskisError.keychainWriteFailed(let status) {
-            print("[Kiskis] WARNING: keyId could not be persisted to Keychain (OSStatus \(status)). " +
-                  "Re-attestation will be required next launch — if this recurs, the device may " +
-                  "be hitting Apple's App Attest key-generation rate limit.")
+            KiskisLog.error(.attestation, "keyId not persisted to Keychain (OSStatus \(status)) — re-attestation required next launch; if it recurs the device may be hitting Apple's key-generation rate limit")
         }
 
         return (keyId, true)
@@ -989,6 +1014,7 @@ public final class KiskisClient: @unchecked Sendable {
             URLQueryItem(name: "version", value: appVersion),
         ]
 
+        KiskisLog.info(.config, "GET /config key=\(configKey) version=\(appVersion)")
         var request = try await signedRequest(path: "config", queryItems: queryItems)
 
         let (data, response) = try await urlSession.kiskisData(for: request)
@@ -998,6 +1024,7 @@ public final class KiskisClient: @unchecked Sendable {
         }
 
         if http.statusCode == 401 || http.statusCode == 403 {
+            KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
             // Assertion failed — might be device migration
             // Try re-attestation once
             attestationManager.clearKeyId()
@@ -1006,15 +1033,19 @@ public final class KiskisClient: @unchecked Sendable {
             request = try await signedRequest(path: "config", queryItems: queryItems)
             let (retryData, retryResponse) = try await urlSession.kiskisData(for: request)
             guard let retryHttp = retryResponse as? HTTPURLResponse, retryHttp.statusCode == 200 else {
+                KiskisLog.error(.config, "retry after re-attestation still failed (\((retryResponse as? HTTPURLResponse)?.statusCode ?? -1))")
                 throw KiskisError.attestationFailed("Re-attestation failed")
             }
+            KiskisLog.info(.config, "GET /config → 200 after re-attestation")
             return try processConfigResponse(retryData, response: retryHttp)
         }
 
         guard http.statusCode == 200 else {
+            KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
             throw KiskisError.serverError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
 
+        KiskisLog.info(.config, "GET /config → 200 (\(data.count) bytes)")
         return try processConfigResponse(data, response: http)
     }
 
@@ -1097,6 +1128,7 @@ public final class KiskisClient: @unchecked Sendable {
     // MARK: - Internal: Helpers
 
     private func fetchChallenge() async throws -> String {
+        KiskisLog.info(.attestation, "POST /auth/challenge")
         let challengeURL = apiURL.appendingPathComponent("auth/challenge")
         var request = URLRequest(url: challengeURL)
         request.httpMethod = "POST"
@@ -1104,6 +1136,7 @@ public final class KiskisClient: @unchecked Sendable {
         let (data, response) = try await urlSession.kiskisData(for: request)
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            KiskisLog.error(.attestation, "POST /auth/challenge failed (\((response as? HTTPURLResponse)?.statusCode ?? -1))")
             throw KiskisError.networkError("Failed to fetch challenge")
         }
 
