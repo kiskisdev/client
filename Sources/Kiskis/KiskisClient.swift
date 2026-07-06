@@ -323,9 +323,38 @@ public final class KiskisClient: @unchecked Sendable {
     private let configCache: ConfigCache
     private let urlSession: URLSession
 
-    /// The device push token as a hex string. Usually set via `setPushToken(_:)` from the
-    /// app delegate; the SDK sends it to the server on the next signed request.
+    /// The device push token as a hex string, for this client only. Prefer the static
+    /// `KiskisClient.setPushToken(_:)`, which applies to every client (and buffers a token
+    /// that arrives before any client exists). The effective token used on requests is this
+    /// value, falling back to the shared one.
     public var pushToken: String?
+
+    // App-wide buffered push token. Set by the static setPushToken(_:) so a token delivered
+    // to the app delegate before any KiskisClient exists — or when no client uses the
+    // "default" key (so KiskisClient.shared is nil) — still reaches every client.
+    private static let sharedPushLock = NSLock()
+    private static var sharedPushTokenHex: String?
+
+    /// The token to send on requests: this client's own, else the app-wide buffered one.
+    private var effectivePushToken: String? {
+        if let pushToken { return pushToken }
+        Self.sharedPushLock.lock(); defer { Self.sharedPushLock.unlock() }
+        return Self.sharedPushTokenHex
+    }
+
+    /// Forward the APNs device token from
+    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`.
+    ///
+    /// Static and buffered: safe to call before any client exists and it applies to every
+    /// client — including apps whose clients all use non-"default" keys (where
+    /// `KiskisClient.shared` is nil). This is the recommended call.
+    public static func setPushToken(_ deviceToken: Data) {
+        let hex = hexString(from: deviceToken)
+        sharedPushLock.lock()
+        sharedPushTokenHex = hex
+        sharedPushLock.unlock()
+        KiskisLog.info(.push, "setPushToken received (\(deviceToken.count) bytes) — buffered for all clients")
+    }
 
     public enum KiskisEnvironment: Sendable { case sandbox, production }
     public var environment: KiskisEnvironment
@@ -447,12 +476,11 @@ public final class KiskisClient: @unchecked Sendable {
         #endif
     }
 
-    /// Forward the APNs device token from
-    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`.
-    /// The SDK hex-encodes it and sends it to the server on the next signed request.
+    /// Instance variant of `setPushToken(_:)`. Sets this client's token and also buffers it
+    /// app-wide (so other clients pick it up). Prefer the static `KiskisClient.setPushToken(_:)`.
     public func setPushToken(_ deviceToken: Data) {
         pushToken = Self.hexString(from: deviceToken)
-        KiskisLog.info(.push, "setPushToken received (\(deviceToken.count) bytes) — sent on next signed request")
+        Self.setPushToken(deviceToken) // also buffer app-wide
     }
 
     /// Lowercase hex encoding of raw token bytes (matches what the server stores).
@@ -871,12 +899,12 @@ public final class KiskisClient: @unchecked Sendable {
             assertionB64 = try await attestationManager.generateAssertion(payload: payload, keyId: keyId)
             KiskisLog.info(.attestation, "signed \(method) \(components.path) keyId=\(kiskisShortKey(keyId))")
         } catch KiskisError.assertionKeyInvalid {
-            KiskisLog.error(.attestation, "stale App Attest key (keyId=\(kiskisShortKey(keyId))) — app likely reinstalled; clearing keyId and re-attesting")
-            attestationManager.clearKeyId()
-            let (freshKeyId, _) = try await performAttestation()
-            keyId = freshKeyId
+            KiskisLog.error(.attestation, "stale App Attest key (keyId=\(kiskisShortKey(keyId))) — app likely reinstalled; re-attesting")
+            // Coordinated + passing the stale keyId: concurrent clients share ONE re-attestation
+            // (performAttestation overwrites the stored keyId, so no explicit clear is needed).
+            keyId = try await attestCoordinated(replacingStaleKey: keyId)
             assertionB64 = try await attestationManager.generateAssertion(payload: payload, keyId: keyId)
-            KiskisLog.info(.attestation, "recovered: re-attested keyId=\(kiskisShortKey(keyId)), signed \(method) \(components.path)")
+            KiskisLog.info(.attestation, "recovered: keyId=\(kiskisShortKey(keyId)), signed \(method) \(components.path)")
         }
 
         // Set assertion headers — X-Client-Data is intentionally omitted;
@@ -892,7 +920,7 @@ public final class KiskisClient: @unchecked Sendable {
         request.setValue(String(ts), forHTTPHeaderField: "X-Request-Ts")
 
         // Include push token if available (for registration/updates)
-        if let pushToken = pushToken {
+        if let pushToken = effectivePushToken {
             request.setValue(pushToken, forHTTPHeaderField: "X-Push-Token")
         }
 
@@ -924,9 +952,24 @@ public final class KiskisClient: @unchecked Sendable {
             return keyId
         }
 
-        // Need to attest
-        let (keyId, _) = try await performAttestation()
-        return keyId
+        // Need to attest — coordinated so concurrent clients for this app share one attestation.
+        return try await attestCoordinated(replacingStaleKey: nil)
+    }
+
+    /// Attest through the per-app coordinator so concurrent clients (one per config key)
+    /// don't each generate a Secure Enclave key + register a duplicate device. The fast path
+    /// reuses a keyId another client just attested, unless it's the `replacingStaleKey` we're
+    /// specifically replacing (stale-key recovery must not reuse the known-bad key).
+    private func attestCoordinated(replacingStaleKey staleKeyId: String?) async throws -> String {
+        let appKey = "\(teamId).\(bundleId)"
+        return try await AttestationCoordinator.forApp(appKey).attest { [self] in
+            if let stored = attestationManager.storedKeyId, !stored.hasPrefix("dc-"), stored != staleKeyId {
+                KiskisLog.info(.attestation, "reusing keyId from a concurrent attestation: \(kiskisShortKey(stored))")
+                return stored
+            }
+            let (keyId, _) = try await performAttestation()
+            return keyId
+        }
     }
 
     /// Perform the full App Attest ceremony with the server.
@@ -960,7 +1003,7 @@ public final class KiskisClient: @unchecked Sendable {
         ]
 
         // Include push token during registration
-        if let pushToken = pushToken {
+        if let pushToken = effectivePushToken {
             body["pushToken"] = pushToken
         }
 
@@ -1025,10 +1068,8 @@ public final class KiskisClient: @unchecked Sendable {
 
         if http.statusCode == 401 || http.statusCode == 403 {
             KiskisLog.error(.config, "GET /config → \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "") — re-attesting and retrying once")
-            // Assertion failed — might be device migration
-            // Try re-attestation once
-            attestationManager.clearKeyId()
-            let _ = try await performAttestation()
+            // Assertion rejected server-side — re-attest (coordinated) and retry once.
+            let _ = try await attestCoordinated(replacingStaleKey: attestationManager.storedKeyId)
             // Retry with fresh assertion
             request = try await signedRequest(path: "config", queryItems: queryItems)
             let (retryData, retryResponse) = try await urlSession.kiskisData(for: request)

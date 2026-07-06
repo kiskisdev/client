@@ -365,9 +365,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     // Forward the APNs token to Kiskis — this one line is required for push delivery.
+    // Static + buffered: works even before any client exists and for apps whose clients
+    // all use non-"default" keys (where KiskisClient.shared is nil).
     func application(_ app: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        KiskisClient.shared?.setPushToken(deviceToken)
+        KiskisClient.setPushToken(deviceToken)
     }
 
     // Handle emergency config refresh
