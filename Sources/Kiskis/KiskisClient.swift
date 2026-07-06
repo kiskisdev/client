@@ -437,9 +437,13 @@ public final class KiskisClient: @unchecked Sendable {
             self.urlSession = URLSession(configuration: .ephemeral)
         }
 
-        // Only set as shared if this is the "default" client (avoids overwriting
-        // with a flags-scoped client accidentally).
-        if self.configKey == "default" {
+        // Set the shared client. Prefer the "default" client, but fall back to the FIRST
+        // client created so apps that only use named keys (challenges/news/packs, no
+        // "default") still get a usable KiskisClient.shared. Why: a common app-delegate
+        // pattern forwards the APNs token via `KiskisClient.shared?.setPushToken(...)`; if
+        // shared were nil for these apps the token would silently drop. Any client works —
+        // setPushToken buffers the token app-wide across every client.
+        if self.configKey == "default" || KiskisClient.shared == nil {
             KiskisClient.shared = self
         }
 
