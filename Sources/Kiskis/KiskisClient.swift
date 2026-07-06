@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Configuration Types
 
@@ -301,6 +304,7 @@ public final class KiskisClient: @unchecked Sendable {
     private let zeroKnowledge: ZeroKnowledgeMode
     private let attestationPolicy: AttestationPolicy
     private let blobIntegrityPolicy: BlobIntegrityPolicy
+    private let autoRegisterPush: Bool
     // Why: never read at init time to avoid Bundle I/O in the initializer.
     // This file is plaintext inside the IPA — secrets must never live here.
     private let fallbackConfigURL: URL?
@@ -309,7 +313,8 @@ public final class KiskisClient: @unchecked Sendable {
     private let configCache: ConfigCache
     private let urlSession: URLSession
 
-    /// The device push token (set by the app delegate after registering for push).
+    /// The device push token as a hex string. Usually set via `setPushToken(_:)` from the
+    /// app delegate; the SDK sends it to the server on the next signed request.
     public var pushToken: String?
 
     public enum KiskisEnvironment: Sendable { case sandbox, production }
@@ -325,6 +330,12 @@ public final class KiskisClient: @unchecked Sendable {
         attestationPolicy: AttestationPolicy = .requireAppAttest,
         blobIntegrityPolicy: BlobIntegrityPolicy = .requireHash,
         certificatePinning: CertificatePinningPolicy = .enabled,
+        /// When true (default), the SDK calls `registerForRemoteNotifications()` on init so
+        /// the app doesn't have to. Your app must still forward the resulting token with
+        /// `setPushToken(_:)` in `didRegisterForRemoteNotificationsWithDeviceToken`, and the
+        /// app target needs the Push Notifications + Background Modes (Remote notifications)
+        /// capabilities. Set false for apps that don't use Kiskis push.
+        autoRegisterPush: Bool = true,
         /// URL to a bundled JSON file used when the network is unavailable on first
         /// launch and no disk cache exists yet.
         ///
@@ -345,6 +356,7 @@ public final class KiskisClient: @unchecked Sendable {
         self.zeroKnowledge = zeroKnowledge
         self.attestationPolicy = attestationPolicy
         self.blobIntegrityPolicy = blobIntegrityPolicy
+        self.autoRegisterPush = autoRegisterPush
         self.fallbackConfigURL = fallbackConfig
 
         // Environment detection priority:
@@ -391,6 +403,47 @@ public final class KiskisClient: @unchecked Sendable {
         if self.configKey == "default" {
             KiskisClient.shared = self
         }
+
+        // Why: the app used to have to call registerForRemoteNotifications() itself, and
+        // forgetting it meant no device ever got a push token. Trigger it here so "it gets
+        // called" automatically. The token still arrives in the app delegate — forward it
+        // with setPushToken(_:). Registration is a no-op/failure (harmless) without the
+        // Push Notifications + Background Modes capabilities.
+        if self.autoRegisterPush {
+            Self.triggerRemoteNotificationRegistration()
+        }
+    }
+
+    // MARK: - Push Registration
+
+    /// Ask the system to register for remote notifications (silent push needs no user
+    /// permission). Called automatically on init unless `autoRegisterPush: false`.
+    /// The APNs token is delivered to your app delegate — forward it with `setPushToken(_:)`.
+    public func registerForPushNotifications() {
+        Self.triggerRemoteNotificationRegistration()
+    }
+
+    private static func triggerRemoteNotificationRegistration() {
+        #if canImport(UIKit) && !os(watchOS)
+        // registerForRemoteNotifications() must run on the main thread.
+        if Thread.isMainThread {
+            UIApplication.shared.registerForRemoteNotifications()
+        } else {
+            DispatchQueue.main.async { UIApplication.shared.registerForRemoteNotifications() }
+        }
+        #endif
+    }
+
+    /// Forward the APNs device token from
+    /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`.
+    /// The SDK hex-encodes it and sends it to the server on the next signed request.
+    public func setPushToken(_ deviceToken: Data) {
+        pushToken = Self.hexString(from: deviceToken)
+    }
+
+    /// Lowercase hex encoding of raw token bytes (matches what the server stores).
+    static func hexString(from data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - App Version

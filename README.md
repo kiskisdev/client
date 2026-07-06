@@ -351,9 +351,8 @@ let endpoints = config.dict("endpoints")
 ```swift
 class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ app: UIApplication, didFinishLaunchingWithOptions opts: ...) -> Bool {
-        // Register for push notifications
-        UIApplication.shared.registerForRemoteNotifications()
-
+        // The SDK calls registerForRemoteNotifications() for you (autoRegisterPush,
+        // on by default) — you don't need to call it here.
         Task {
             do {
                 let config = try await KiskisClient.shared?.fetchConfig()
@@ -365,11 +364,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         return true // Don't block main thread
     }
 
-    // Pass push token to Kiskis
+    // Forward the APNs token to Kiskis — this one line is required for push delivery.
     func application(_ app: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        let token = deviceToken.map { String(format: "%02x", $0) }.joined()
-        KiskisClient.shared?.pushToken = token
+        KiskisClient.shared?.setPushToken(deviceToken)
     }
 
     // Handle emergency config refresh
