@@ -932,10 +932,7 @@ public final class KiskisClient: @unchecked Sendable {
             // Bypass path: send the secret instead of an App Attest assertion.
             // The server verifies the secret against a SHA-256 hash in DynamoDB and,
             // if valid, treats the request as authenticated for this (teamId, bundleId).
-            request.setValue(bypassSecret, forHTTPHeaderField: "X-Bypass-Token")
-            request.setValue(teamId, forHTTPHeaderField: "X-Team-Id")
-            request.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
-            return request
+            return Self.applyBypassHeaders(to: request, secret: bypassSecret, teamId: teamId, bundleId: bundleId)
         }
         #endif
 
@@ -1069,6 +1066,24 @@ public final class KiskisClient: @unchecked Sendable {
     static func shouldReuseStoredKey(_ stored: String?, replacing staleKeyId: String?) -> Bool {
         guard let stored, !stored.hasPrefix("dc-") else { return false }
         return stored != staleKeyId
+    }
+
+    /// Apply the simulator-bypass headers. Static + unconditionally compiled so the header
+    /// CONTRACT is unit-testable on any platform (the call site stays simulator-gated).
+    ///
+    /// Why X-Environment is hardcoded to "sandbox": the server's bypass gate only accepts
+    /// sandbox-scoped requests (bypass can never yield production access), and an absent
+    /// header defaults to production server-side. The original code returned BEFORE the
+    /// signed path set X-Environment, so every bypass request defaulted to production and
+    /// was rejected — the bug that silently broke simulator support when the server gate
+    /// added the sandbox requirement.
+    static func applyBypassHeaders(to request: URLRequest, secret: String, teamId: String, bundleId: String) -> URLRequest {
+        var req = request
+        req.setValue(secret, forHTTPHeaderField: "X-Bypass-Token")
+        req.setValue(teamId, forHTTPHeaderField: "X-Team-Id")
+        req.setValue(bundleId, forHTTPHeaderField: "X-Bundle-Id")
+        req.setValue("sandbox", forHTTPHeaderField: "X-Environment")
+        return req
     }
 
     /// Perform the full App Attest ceremony with the server.
