@@ -415,16 +415,20 @@ public final class KiskisClient: @unchecked Sendable {
         // 1. Explicit override (if developer passed environment:)
         // 2. Server-detected from previous attestation (persisted in Keychain)
         // 3. Fallback to #if DEBUG heuristic (used until first attestation)
+        let envSource: String
         if let env = environment {
             self.environment = env
+            envSource = "explicit override"
         } else if let persisted = KeychainHelper.load(key: "kiskis.env.\(self.teamId).\(self.bundleId)") {
             self.environment = persisted == "sandbox" ? .sandbox : .production
+            envSource = "server-detected (persisted from a prior attestation)"
         } else {
             #if DEBUG
             self.environment = .sandbox
             #else
             self.environment = .production
             #endif
+            envSource = "unattested guess (#if DEBUG heuristic) — the server's AAGUID overrides this on first attestation"
         }
 
         // Cache is scoped per (teamId, bundleId, key) — multiple clients for the same
@@ -461,6 +465,29 @@ public final class KiskisClient: @unchecked Sendable {
         }
 
         KiskisLog.info(.config, "init team=\(self.teamId) bundle=\(self.bundleId) key=\(self.configKey) env=\(self.environment == .sandbox ? "sandbox" : "production") attestation=\(self.attestationPolicy == .requireAppAttest ? "requireAppAttest" : "allowDeviceCheck") autoRegisterPush=\(self.autoRegisterPush)")
+
+        // ── Client-side environment diagnostic (the counterpart to the server's
+        // ATTEST_ENV_DIAG log). Shows what the CLIENT thinks and why, on-device, in the
+        // Xcode/Console.app log — no CloudWatch needed. The client CANNOT read the App
+        // Attest environment itself: the AAGUID lives inside Apple's opaque attestation
+        // blob, decoded only server-side. See that log for the authoritative answer.
+        #if targetEnvironment(simulator)
+        let deviceKind = "SIMULATOR (App Attest unsupported → dev-bypass path, always sandbox)"
+        #else
+        let deviceKind = "real device"
+        #endif
+        #if DEBUG
+        let buildConfig = "DEBUG"
+        #else
+        let buildConfig = "RELEASE"
+        #endif
+        let appAttest = attestationManager.isSupported ? "supported" : "UNSUPPORTED"
+        KiskisLog.info(.attestation, "env-diag: build=\(buildConfig) target=\(deviceKind) appAttest=\(appAttest) sdkEnv=\(self.environment == .sandbox ? "sandbox" : "production") source=\(envSource)")
+        // Why a DEBUG build reports production: App Attest ignores build config and
+        // defaults to the PRODUCTION environment unless the app ships the
+        // com.apple.developer.devicecheck.appattest-environment=development entitlement
+        // (Xcode does NOT add it automatically the way it does aps-environment for push).
+        KiskisLog.info(.attestation, "env-diag: the authoritative App Attest environment is decided server-side from the attestation AAGUID; a DEBUG build defaults to PRODUCTION unless the appattest-environment=development entitlement is set. (Push/APNs environment is separate and IS auto-set by Xcode to sandbox for DEBUG.)")
 
         // Why: the app used to have to call registerForRemoteNotifications() itself, and
         // forgetting it meant no device ever got a push token. Trigger it here so "it gets
