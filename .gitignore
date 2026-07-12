@@ -1,3 +1,4 @@
 *.p8
 *.swp
 *.build/*
+.DS_Store
