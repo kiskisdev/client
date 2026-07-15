@@ -32,6 +32,29 @@ final class ConfigCache: @unchecked Sendable {
     /// In-memory cache — instant access, no disk read
     private var memoryCache: KiskisConfig?
 
+    /// Serializes every entry point. What makes `@unchecked Sendable` above actually true —
+    /// without this, that annotation was an unbacked claim.
+    ///
+    /// Why it's needed: `backgroundRefresh` defaults to true, and KiskisClient fires
+    /// `Task { try? await refreshConfigFromServer() }` on every cache hit without awaiting it.
+    /// So a detached refresh writing the cache while the app reads it is the NORMAL path, not
+    /// a corner case. `memoryCache` was mutated from those tasks with no synchronization at
+    /// all — a data race, which in Swift is undefined behaviour rather than a stale read.
+    ///
+    /// It also makes each save atomic as a WHOLE. Individual writes already use `.atomic`, but
+    /// config and metadata are two separate files: two overlapping saves could interleave into
+    /// config-from-B paired with metadata-from-A, so the stored config would carry the wrong
+    /// fetch time and TTL. Holding the lock across both writes prevents that pairing.
+    ///
+    /// Why RECURSIVE and not a plain NSLock: `load()` and `loadEncryptedRaw()` both call
+    /// `clear()` on a corrupt-cache path. A non-recursive lock would deadlock there — hanging
+    /// the host app, which is a worse failure than the race being fixed here.
+    ///
+    /// Scope note: this guards a single process. Two processes sharing the container (an app
+    /// and its extension) can still interleave; the `.atomic` per-file writes keep each file
+    /// individually intact, and the versioned single-envelope format would be the real fix.
+    private let lock = NSRecursiveLock()
+
     init(keychainGroup: String, cachePolicy: CachePolicy) {
         self.cachePolicy = cachePolicy
 
@@ -62,6 +85,7 @@ final class ConfigCache: @unchecked Sendable {
     /// Load cached config. Returns nil if no cache exists or if disk holds ZK ciphertext
     /// (caller must use loadEncryptedRaw() + decrypt for the cold-start ZK path).
     func load() -> KiskisConfig? {
+        lock.lock(); defer { lock.unlock() }
         // Level 1: in-memory (instant)
         if let cached = memoryCache {
             let age = Date().timeIntervalSince(cached.fetchedAt)
@@ -126,6 +150,7 @@ final class ConfigCache: @unchecked Sendable {
 
     /// Save plaintext config data to file cache and memory.
     func save(data: Data, ttl: TimeInterval = ConfigCache.defaultTTL) {
+        lock.lock(); defer { lock.unlock() }
         // Write config data to file
         try? data.write(to: configFile, options: writeOptions())
 
@@ -153,6 +178,7 @@ final class ConfigCache: @unchecked Sendable {
     /// Save ZK-mode config: ciphertext goes to disk, plaintext stays in memory only.
     /// On the cold-start read path, use loadEncryptedRaw() + decrypt rather than load().
     func saveEncrypted(ciphertextData: Data, plaintextData: Data, ttl: TimeInterval = ConfigCache.defaultTTL) {
+        lock.lock(); defer { lock.unlock() }
         // Why: ZK guarantee — disk holds ciphertext only; an attacker with file access
         // cannot read secrets while the device is unlocked without also having the vault key.
         try? ciphertextData.write(to: configFile, options: writeOptions())
@@ -176,6 +202,7 @@ final class ConfigCache: @unchecked Sendable {
     /// Return the raw ciphertext bytes from disk for the ZK cold-start decrypt path.
     /// Returns nil if the cache is absent, not encrypted, or beyond maxStaleness.
     func loadEncryptedRaw() -> (data: Data, fetchedAt: Date, ttl: TimeInterval)? {
+        lock.lock(); defer { lock.unlock() }
         guard let metadata = readMetadata(), metadata.isEncrypted else { return nil }
         guard FileManager.default.fileExists(atPath: configFile.path),
               let data = try? Data(contentsOf: configFile) else { return nil }
@@ -190,6 +217,7 @@ final class ConfigCache: @unchecked Sendable {
 
     /// Clear both memory and file cache.
     func clear() {
+        lock.lock(); defer { lock.unlock() }
         memoryCache = nil
         try? FileManager.default.removeItem(at: configFile)
         try? FileManager.default.removeItem(at: metadataFile)
