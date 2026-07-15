@@ -1084,6 +1084,24 @@ public final class KiskisClient: @unchecked Sendable {
         return stored != staleKeyId
     }
 
+    /// The keyId a failed request actually signed with — the one stale-key recovery must replace.
+    ///
+    /// Prefer the value captured BEFORE the request: by recovery time a sibling client may have
+    /// already replaced the stored key, and reusing that late read is what spawned duplicate
+    /// device records.
+    ///
+    /// Fall back to the post-request value only when nothing was captured, which means this was
+    /// a FIRST launch — there was no key when the request began, so the request itself minted one
+    /// inside `executeSignedRequest`. That nil used to flow straight into
+    /// `shouldReuseStoredKey(newKey, replacing: nil)`, which answers `true`, so re-attestation
+    /// reused the very key the server had just rejected and the documented "last resort" silently
+    /// became a third same-key retry that could never recover. The late read is safe in exactly
+    /// this case: with no prior key, `AttestationCoordinator` guarantees one attestation per app,
+    /// so the stored value IS the key this request signed with.
+    static func staleKeyForRecovery(capturedBeforeRequest: String?, storedAfterRequest: String?) -> String? {
+        capturedBeforeRequest ?? storedAfterRequest
+    }
+
     /// Apply the simulator-bypass headers. Static + unconditionally compiled so the header
     /// CONTRACT is unit-testable on any platform (the call site stays simulator-gated).
     ///
@@ -1191,8 +1209,14 @@ public final class KiskisClient: @unchecked Sendable {
         // Capture the keyId this request signs with, BEFORE sending. If the server rejects it
         // and we re-attest, this is the "stale" keyId to replace — not the live stored value,
         // which a sibling client may have already replaced (that late read spawned duplicates).
-        let signingKeyId = attestationManager.storedKeyId
+        let keyIdBeforeRequest = attestationManager.storedKeyId
         var (data, http) = try await executeSignedRequest(path: "config", queryItems: queryItems)
+        // On a first launch the capture above is nil — the request itself minted the key. Resolve
+        // that here or re-attestation reuses the rejected key; see staleKeyForRecovery.
+        let signingKeyId = Self.staleKeyForRecovery(
+            capturedBeforeRequest: keyIdBeforeRequest,
+            storedAfterRequest: attestationManager.storedKeyId
+        )
 
         // Recover from a server 401/403 WITHOUT minting a new device on a transient rejection.
         // See ConfigAuthRecovery: the local key is valid (a stale key throws before the HTTP

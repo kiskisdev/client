@@ -52,6 +52,33 @@ final class AttestationCoordinatorTests: XCTestCase {
         XCTAssertFalse(KiskisClient.shouldReuseStoredKey("dc-abc", replacing: "X"))
     }
 
+    // Which keyId stale-key recovery must replace. The value captured before the request wins,
+    // because by recovery time a sibling may have replaced the stored one — reusing that late
+    // read is what spawned duplicate devices.
+    func testStaleKeyForRecovery() {
+        // Steady state: a key existed up front, so that's the one that signed and failed —
+        // even though a sibling has since stored Y.
+        XCTAssertEqual(
+            KiskisClient.staleKeyForRecovery(capturedBeforeRequest: "X", storedAfterRequest: "Y"), "X")
+        // First launch: nothing up front, so the request itself minted K — K is what failed.
+        XCTAssertEqual(
+            KiskisClient.staleKeyForRecovery(capturedBeforeRequest: nil, storedAfterRequest: "K"), "K")
+        // No key on either side (e.g. the simulator bypass path never mints one).
+        XCTAssertNil(
+            KiskisClient.staleKeyForRecovery(capturedBeforeRequest: nil, storedAfterRequest: nil))
+    }
+
+    // The first-launch bug, at the level where it actually bit: the two helpers composed.
+    // No key existed, the request minted K, the server rejected K — and the un-resolved nil made
+    // the documented "last resort" re-attestation reuse K, so it could never recover.
+    func testFirstLaunchRecoveryDoesNotReuseRejectedKey() {
+        // The old path: nil flowed straight through, and K looked reusable.
+        XCTAssertTrue(KiskisClient.shouldReuseStoredKey("K", replacing: nil))
+        // Fixed: resolve the stale key first, and K is correctly refused → a new key is minted.
+        let stale = KiskisClient.staleKeyForRecovery(capturedBeforeRequest: nil, storedAfterRequest: "K")
+        XCTAssertFalse(KiskisClient.shouldReuseStoredKey("K", replacing: stale))
+    }
+
     func testSequentialCallersReattest() async throws {
         // Once an attestation completes, a later (non-overlapping) call attests again — the
         // caller decides via the fast path whether a fresh attestation is actually needed.
