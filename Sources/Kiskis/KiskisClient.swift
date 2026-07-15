@@ -695,6 +695,11 @@ public final class KiskisClient: @unchecked Sendable {
         // Download from S3 over the unpinned blob session — the API's Let's Encrypt pin
         // cannot match S3's Amazon chain. Integrity is enforced by the SHA-256 check below.
         let (tempURL, response) = try await blobSession.kiskisDownload(from: presignedURL)
+        // Why defer: URLSession hands us a temp file we own, and every early exit below (bad
+        // status, hash mismatch, a key that escapes the blob directory, a failed move) used to
+        // strand it in tmp — an unbounded leak for an SDK that downloads ML models. On the happy
+        // path the file is MOVED to its destination, so this removal is a harmless no-op.
+        defer { try? FileManager.default.removeItem(at: tempURL) }
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw KiskisError.blobDownloadFailed("Bad response from S3")
@@ -731,9 +736,25 @@ public final class KiskisClient: @unchecked Sendable {
             finalURL = destination
         } else {
             let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            let blobDir = caches.appendingPathComponent("kiskis-blobs")
-            try FileManager.default.createDirectory(at: blobDir, withIntermediateDirectories: true)
-            let dest = blobDir.appendingPathComponent(ref.key)
+            let blobDir = caches.appendingPathComponent("kiskis-blobs").standardizedFileURL
+
+            // Why the containment check: ref.key comes from the config — server-controlled — and
+            // appendingPathComponent does NOT interpret away "..", so a key like "../../foo"
+            // resolves OUTSIDE blobDir. That turns a config value into an arbitrary-write
+            // primitive anywhere the app can write inside its own sandbox, including over the
+            // app's own files. Standardize first, then require the result to still sit under
+            // blobDir. Containment (rather than banning "/") is deliberate: nested keys like
+            // "models/model.bin" are legitimate and stay supported.
+            //
+            // The caller-supplied `destination` branch above is intentionally NOT checked — that
+            // path is the app's own choice, not the server's.
+            guard let dest = Self.blobDestination(for: ref.key, in: blobDir) else {
+                throw KiskisError.blobDownloadFailed(
+                    "Blob key \"\(ref.key)\" escapes the blob directory")
+            }
+
+            try FileManager.default.createDirectory(
+                at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: dest.path) {
                 try FileManager.default.removeItem(at: dest)
             }
@@ -1142,6 +1163,23 @@ public final class KiskisClient: @unchecked Sendable {
         ts > now - windowSeconds && ts < now + windowSeconds
     }
 
+    /// Resolve where a blob key may be written under `blobDir`. Returns nil if it escapes.
+    ///
+    /// Why this exists: the key comes from config — server-controlled — and
+    /// `appendingPathComponent` does not interpret away "..", so "../../foo" resolves OUTSIDE
+    /// the blob directory. Unchecked, that makes a config value an arbitrary-write primitive
+    /// anywhere inside the app's sandbox, including over the app's own files.
+    ///
+    /// Containment rather than banning "/": nested keys ("models/model.bin") are legitimate.
+    /// The comparison appends "/" to the directory on purpose — without it, a sibling like
+    /// "kiskis-blobs-evil" would prefix-match "kiskis-blobs" and slip through.
+    static func blobDestination(for key: String, in blobDir: URL) -> URL? {
+        let base = blobDir.standardizedFileURL
+        let dest = base.appendingPathComponent(key).standardizedFileURL
+        guard dest.path.hasPrefix(base.path + "/") else { return nil }
+        return dest
+    }
+
     /// Apply the simulator-bypass headers. Static + unconditionally compiled so the header
     /// CONTRACT is unit-testable on any platform (the call site stays simulator-gated).
     ///
@@ -1371,6 +1409,18 @@ public final class KiskisClient: @unchecked Sendable {
               let urlString = json["url"] as? String,
               let url = URL(string: urlString) else {
             throw KiskisError.blobDownloadFailed("Invalid presigned URL response")
+        }
+
+        // Why require https explicitly: this URL names the host we then fetch from, and blob
+        // bytes travel on the UNPINNED blob session (S3's Amazon chain cannot match the API's
+        // Let's Encrypt pin, so that session deliberately drops the extra pin). Nothing else
+        // here would reject "http://…" — the response is JSON off the API and is not itself
+        // signature-verified — so a server returning a plaintext URL would put blob contents on
+        // the wire in the clear. The SHA-256 check still catches tampering, but only after the
+        // bytes have already been exposed, and confidentiality is not something a hash restores.
+        guard url.scheme?.lowercased() == "https" else {
+            throw KiskisError.blobDownloadFailed(
+                "Presigned blob URL must use https (got \"\(url.scheme ?? "no scheme")\")")
         }
 
         return url
