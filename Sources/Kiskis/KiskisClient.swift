@@ -901,7 +901,7 @@ public final class KiskisClient: @unchecked Sendable {
     private func verifyResponseSignature(sig sigB64url: String, ts: Int, path: String, body: Data) -> Bool {
         // Reject responses outside a ±5-minute replay window
         let now = Int(Date().timeIntervalSince1970)
-        guard abs(now - ts) < 300 else { return false }
+        guard Self.timestampWithinWindow(ts, now: now) else { return false }
 
         // base64url → base64 (replace URL-safe chars, add padding)
         var b64 = sigB64url
@@ -1122,6 +1122,24 @@ public final class KiskisClient: @unchecked Sendable {
     /// so the stored value IS the key this request signed with.
     static func staleKeyForRecovery(capturedBeforeRequest: String?, storedAfterRequest: String?) -> String? {
         capturedBeforeRequest ?? storedAfterRequest
+    }
+
+    /// Whether a server-supplied signature timestamp falls inside the replay window.
+    ///
+    /// Why a range check and not `abs(now - ts)`: `ts` is parsed straight out of the
+    /// `X-Kiskis-Sig-Ts` response header, and `Int(_:)` happily accepts `Int.min`. Both
+    /// `now - Int.min` and `abs(Int.min)` **trap** in Swift — an overflow is a crash, not a
+    /// thrown error — and this runs BEFORE the signature is verified, so no valid signature is
+    /// needed to reach it. A single malformed header (from a compromised server, or just a bad
+    /// deploy emitting a garbage timestamp) would have taken down the host app on both the
+    /// config and /user/data paths. An SDK must never crash its host on server input.
+    ///
+    /// Bounding `ts` against a window computed from `now` never does arithmetic on the
+    /// untrusted number — `now` is a sane epoch value, nowhere near the Int limits. Exactly
+    /// equivalent to the old comparison for every input that did not trap:
+    /// `abs(now - ts) < w`  ⇔  `now - w < ts < now + w`.
+    static func timestampWithinWindow(_ ts: Int, now: Int, windowSeconds: Int = 300) -> Bool {
+        ts > now - windowSeconds && ts < now + windowSeconds
     }
 
     /// Apply the simulator-bypass headers. Static + unconditionally compiled so the header
