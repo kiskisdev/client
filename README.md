@@ -64,7 +64,7 @@ That single call:
 | Config key | You provide it | Required (e.g. `"default"`, `"flags"`) |
 | Bundle ID | `Bundle.main.bundleIdentifier` | Yes, pass `bundleId:` |
 | App Version | `CFBundleShortVersionString` in Info.plist | No (always auto-detected) |
-| Environment | `#if DEBUG` → sandbox, else production | Yes, pass `environment:` |
+| Environment | Server-detected from Apple's attestation (AAGUID) and persisted — **a debug build on a device attests `production`**; `#if DEBUG` is only a first-launch hint | Yes, pass `environment:` — rarely correct, see below |
 
 Together Team ID + Bundle ID + **key** + version form the config lookup. Each client instance is bound to one key — to read from a different config document (e.g., feature flags), create another `KiskisClient` with a different `key:`.
 
@@ -1073,6 +1073,15 @@ let kiskis = KiskisClient(
 ```
 
 This is rarely needed — the server detection is authoritative and correct for all normal development and release workflows.
+
+> **Forcing `.sandbox` will 401 unless the app really does attest as development.** A device
+> is *registered* into the partition the server detects from the AAGUID, but *looked up*
+> using the environment the SDK sends. Force `.sandbox` on a build that attests production —
+> which is every build without the
+> `com.apple.developer.devicecheck.appattest-environment = development` entitlement,
+> **including debug builds run from Xcode** — and it registers under production but is looked
+> up under sandbox, so every request fails auth. If you want a real device on sandbox, add
+> that entitlement (and upload sandbox config); otherwise don't override.
 
 ## Testing
 
