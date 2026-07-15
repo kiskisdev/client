@@ -1062,7 +1062,7 @@ public final class KiskisClient: @unchecked Sendable {
     /// specifically replacing (stale-key recovery must not reuse the known-bad key).
     private func attestCoordinated(replacingStaleKey staleKeyId: String?) async throws -> String {
         let appKey = "\(teamId).\(bundleId)"
-        return try await AttestationCoordinator.forApp(appKey).attest { [self] in
+        let keyId = try await AttestationCoordinator.forApp(appKey).attest { [self] in
             let stored = attestationManager.storedKeyId
             if Self.shouldReuseStoredKey(stored, replacing: staleKeyId), let stored {
                 KiskisLog.info(.attestation, "reusing keyId a sibling just attested: \(kiskisShortKey(stored))")
@@ -1071,6 +1071,28 @@ public final class KiskisClient: @unchecked Sendable {
             let (keyId, _) = try await performAttestation()
             return keyId
         }
+        // Why re-read the environment here: the coordinator shares the keyId but NOT the
+        // environment. Only the client that actually ran performAttestation() sees the server's
+        // authoritative answer and updates its own `environment`; a sibling that reused that key
+        // keeps whatever it guessed at init. On a real device that guess is WRONG for every debug
+        // build — #if DEBUG guesses .sandbox, but a build without the appattest-environment
+        // entitlement attests PRODUCTION. The sibling would then send X-Environment: sandbox for a
+        // device registered under PROD#, 401 on every request, and "recover" by minting a second
+        // Secure Enclave key — the duplicate device record the coordinator exists to prevent, plus
+        // a needless hit on Apple's key-generation rate limit.
+        //
+        // The attesting client persists the answer BEFORE returning the keyId, so by the time we
+        // get here it is readable — no coordinator signature change needed. Server-detected wins
+        // over the init-time value, which is exactly what performAttestation already does for the
+        // attesting client; this just extends the same rule to its siblings.
+        if let persisted = KeychainHelper.load(key: "kiskis.env.\(teamId).\(bundleId)") {
+            let serverEnv: KiskisEnvironment = persisted == "sandbox" ? .sandbox : .production
+            if serverEnv != environment {
+                KiskisLog.info(.attestation, "env corrected to \(persisted) from the attestation a sibling shared")
+                environment = serverEnv
+            }
+        }
+        return keyId
     }
 
     /// Whether the stored keyId can be reused instead of attesting again. It must exist, be a
