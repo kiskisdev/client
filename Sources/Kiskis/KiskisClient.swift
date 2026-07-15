@@ -335,6 +335,10 @@ public final class KiskisClient: @unchecked Sendable {
     private let attestationManager: AttestationManager
     private let configCache: ConfigCache
     private let urlSession: URLSession
+    /// Separate session for downloading blob BYTES from presigned S3 URLs. Never pinned —
+    /// see the comment where it's created. The presigned URL itself is fetched over
+    /// `urlSession` (the pinned API session); only the S3 GET uses this one.
+    private let blobSession: URLSession
 
     /// The device push token as a hex string, for this client only. Prefer the static
     /// `KiskisClient.setPushToken(_:)`, which applies to every client (and buffers a token
@@ -453,6 +457,17 @@ public final class KiskisClient: @unchecked Sendable {
         case .disabled:
             self.urlSession = URLSession(configuration: .ephemeral)
         }
+
+        // Why blob bytes get their own, deliberately UNPINNED session: presigned blob URLs
+        // point at S3, which serves an Amazon CA chain. The Let's Encrypt SPKI pins can never
+        // match it, so downloading a blob through `urlSession` failed 100% of the time with
+        // pinning on — which is the default. Blobs do not need the pin: the expected SHA-256
+        // arrives over the authenticated, signature-verified config channel and is checked
+        // against the downloaded bytes (blobIntegrityPolicy), which is a stronger guarantee
+        // than trusting the transport. Standard TLS chain + hostname validation still applies
+        // here; only the extra SPKI pin is dropped. The presigned URL itself is still fetched
+        // over the pinned API session above.
+        self.blobSession = URLSession(configuration: .ephemeral)
 
         // Set the shared client. Prefer the "default" client, but fall back to the FIRST
         // client created so apps that only use named keys (challenges/news/packs, no
@@ -677,8 +692,9 @@ public final class KiskisClient: @unchecked Sendable {
         // Get presigned URL from Kiskis API
         let presignedURL = try await fetchPresignedBlobURL(blobKey: ref.key)
 
-        // Download from S3
-        let (tempURL, response) = try await urlSession.kiskisDownload(from: presignedURL)
+        // Download from S3 over the unpinned blob session — the API's Let's Encrypt pin
+        // cannot match S3's Amazon chain. Integrity is enforced by the SHA-256 check below.
+        let (tempURL, response) = try await blobSession.kiskisDownload(from: presignedURL)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw KiskisError.blobDownloadFailed("Bad response from S3")

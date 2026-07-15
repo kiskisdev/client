@@ -26,7 +26,7 @@ import Security
 ///
 /// Update `pinnedSPKIHashes` with the intermediate CA hash(es) from the output above.
 /// Include at least one backup hash so future key rotation can be deployed in advance.
-final class PinningDelegate: NSObject, URLSessionDelegate {
+final class PinningDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
     // MARK: - Pinned hashes
 
@@ -128,5 +128,41 @@ final class PinningDelegate: NSObject, URLSessionDelegate {
         var spki = Data(spkiHeader)
         spki.append(rawKeyData)
         return Data(SHA256.hash(data: spki))
+    }
+
+    // MARK: - Redirects
+
+    /// Refuse cross-host redirects on the API session.
+    ///
+    /// Why: URLSession follows redirects automatically and replays the original request's
+    /// headers at the new location — which for this SDK means `X-Assertion`, `X-Key-Id`,
+    /// `X-Team-Id` and `X-Bundle-Id`. Pinning does NOT protect against this. The pins match a
+    /// CA, not a host, so a redirect to an attacker-controlled host holding its own Let's
+    /// Encrypt certificate would satisfy both hostname validation (it genuinely *is* that
+    /// host) and the SPKI pin, and the signed headers would be handed over.
+    ///
+    /// Same-host redirects are allowed: the headers stay with the intended server, and the
+    /// assertion is bound to method+path+query+body anyway, so it cannot be replayed onto a
+    /// different route. Only a change of host is refused.
+    ///
+    /// Refusing means `completionHandler(nil)`: the task completes with the 3xx response
+    /// instead of following it, so the caller's status-code check surfaces a clear failure.
+    /// The API never legitimately redirects — one that appears is a misconfiguration or an
+    /// attack, and either way is worth failing on. Blob downloads run on a separate,
+    /// delegate-free session, so S3's own region redirects are unaffected by this.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let originalHost = task.originalRequest?.url?.host
+        let newHost = request.url?.host
+        if let originalHost, let newHost, originalHost.caseInsensitiveCompare(newHost) == .orderedSame {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)
+        }
     }
 }
